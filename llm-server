@@ -507,15 +507,26 @@ try_start() {
 print_cmd() {
     echo ""
     echo "Command:"
-    echo "  $LLAMA_SERVER \\"
+    local line="  $LLAMA_SERVER"
     local args=("$@")
     for (( i=0; i<${#args[@]}; i++ )); do
-        if (( i == ${#args[@]} - 1 )); then
-            echo "    ${args[$i]}"
+        local arg="${args[$i]}"
+        # Pair --flag with its value (next arg that doesn't start with -)
+        if [[ "$arg" == -* ]] && (( i + 1 < ${#args[@]} )) && [[ "${args[$((i+1))]}" != -* ]]; then
+            local pair="$arg ${args[$((i+1))]}"
+            i=$(( i + 1 ))
         else
-            echo "    ${args[$i]} \\"
+            local pair="$arg"
+        fi
+        # Wrap lines at ~80 chars
+        if (( ${#line} + ${#pair} + 1 > 80 )); then
+            echo "$line \\"
+            line="    $pair"
+        else
+            line="$line $pair"
         fi
     done
+    echo "$line"
 }
 
 # Run benchmark: send a prompt, measure tok/s

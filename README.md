@@ -8,6 +8,8 @@ llm-server ~/ai_models/Qwen3.5-397B-A17B-UD-IQ3_XXS.gguf
 
 That's it. It handles everything: GPU detection, MoE expert placement, KV cache sizing, context reduction, crash recovery.
 
+![demo](demo.gif)
+
 ## Features
 
 - **Auto GPU detection** — works with 0 to 8+ GPUs, any mix of NVIDIA cards
