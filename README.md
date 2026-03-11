@@ -15,13 +15,15 @@ That's it. It handles everything: GPU detection, MoE expert placement, KV cache 
 - **Auto GPU detection** — works with 0 to 8+ GPUs, any mix of NVIDIA cards
 - **Heterogeneous GPU support** — different VRAM sizes, different PCIe bandwidths, properly weighted
 - **MoE expert auto-placement** — starts conservative, measures actual VRAM usage, optimizes, caches for instant next startup
-- **Smart KV cache** — picks q8_0 when there's headroom, falls back to q4_0 when tight
+- **Smart KV cache** — `--kv-quality high|mid|low` (f16/q8_0/q4_0, default: mid)
 - **Dynamic batch sizing** — scales with available VRAM
 - **Crash recovery** — auto-restarts with backoff on runtime crashes
 - **Config caching** — first run auto-tunes, subsequent runs start instantly
 - **SSM/Mamba hybrid support** — detects and disables incompatible features
 - **GGUF metadata parsing** — reads layer count, expert count, KV heads directly from model file
 - **CPU-only mode** — `--cpu` to force CPU-only inference (when GPUs are busy)
+- **ik_llama.cpp graph split** — auto-detects ik_llama.cpp and uses `--split-mode graph` for multi-GPU (with automatic fallback to layer split if NCCL fails)
+- **Custom binary/lib paths** — `--server-bin` and `--lib-path` flags for custom builds or Docker
 - **Benchmark mode** — `--benchmark` to measure tok/s after startup
 - **Dry-run mode** — `--dry-run` to print the command without executing
 
@@ -69,6 +71,15 @@ llm-server --benchmark model.gguf
 # Force CPU-only (ignore GPUs)
 llm-server --cpu model.gguf
 
+# KV cache quality: high (f16), mid (q8_0, default), low (q4_0)
+llm-server --kv-quality high model.gguf
+
+# Custom llama-server binary
+llm-server --server-bin /opt/llama/bin/llama-server model.gguf
+
+# Custom library path (useful for Docker or custom builds)
+llm-server --lib-path /usr/local/lib/llama model.gguf
+
 # Model picker TUI
 llm-server-gui
 ```
@@ -96,7 +107,7 @@ The script evaluates your hardware and model, then picks the best strategy:
 │  └─ Yes → single_gpu (all layers on fastest GPU)
 │
 ├─ Dense model fits across all GPUs?
-│  └─ Yes → multi_gpu_dense (row split for parallel matmuls)
+│  └─ Yes → multi_gpu_dense (graph split on ik_llama.cpp, row split on mainline)
 │
 ├─ MoE model?
 │  └─ Yes → moe_offload (experts on GPU by bandwidth priority, rest on CPU)
@@ -130,7 +141,7 @@ The script auto-configures based on your hardware:
 
 | Flag | Logic |
 |------|-------|
-| KV cache type | q8_0 if VRAM/RAM allows, q4_0 otherwise |
+| KV cache type | `--kv-quality`: high (f16), mid (q8_0, default), low (q4_0) |
 | Batch size | 8192 with headroom, 4096 if tight, 2048 for offload |
 | Thread count | Physical cores (not hyperthreads) |
 | Context shift | Disabled for SSM/Mamba hybrids (crashes) |
@@ -190,6 +201,21 @@ sudo cp examples/systemd/llm-server.service /etc/systemd/system/llm-server@.serv
 sudo systemctl enable --now llm-server@yourusername
 ```
 
+## Docker
+
+The script works inside Docker containers. Requirements:
+
+```bash
+docker run --gpus all --ipc=host \
+  -v /path/to/models:/models \
+  your-image llm-server /models/model.gguf
+```
+
+- `--gpus all` — exposes NVIDIA GPUs
+- `--ipc=host` — required for NCCL multi-GPU communication (graph split)
+- `lsof` must be installed in the image (used for port cleanup)
+- Use `--server-bin` and `--lib-path` if the binary/libs aren't in the default paths
+
 ## Why ik_llama.cpp?
 
 [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) is a fork of llama.cpp optimized for multi-GPU and MoE inference. Key advantages:
@@ -197,7 +223,7 @@ sudo systemctl enable --now llm-server@yourusername
 - **Expert CPU offload** (`-ot exps=CPU`) — keeps attention on GPU, offloads expert FFN weights to RAM
 - **Merged QKV** (`-mqkv`) — fused attention for faster inference
 - **Fused delta-net** — optimized SSM kernels
-- **Full graph parallel for Qwen3.5** — better multi-GPU utilization
+- **Graph split mode** (`--split-mode graph`) — true tensor parallelism across GPUs, significantly faster than layer/row split
 
 `llm-server` auto-detects which backend you have and works with either.
 

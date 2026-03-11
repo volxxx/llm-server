@@ -11,6 +11,9 @@
 #   llm-server --port 8082 <model.gguf>  # Custom port
 #   llm-server <model.gguf> --benchmark  # Start, run quick benchmark, print tok/s
 #   llm-server <model.gguf> --cpu        # Force CPU-only (ignore GPUs)
+#   llm-server <model.gguf> --server-bin /path/to/llama-server
+#   llm-server <model.gguf> --lib-path /path/to/libs
+#   llm-server <model.gguf> --kv-quality high  # KV cache: high(f16), mid(q8_0), low(q4_0)
 #
 # Environment variables:
 #   LLAMA_SERVER    Path to llama-server binary (auto-detected if not set)
@@ -38,6 +41,9 @@ VERBOSE=0
 BENCHMARK=0
 CPU_ONLY=0
 MODEL_ARG=""
+USER_SERVER_BIN=""
+USER_LIB_PATH=""
+KV_QUALITY="mid"  # high (f16), mid (q8_0, default), low (q4_0)
 
 # Auto-detect llama-server binary
 find_server_binary() {
@@ -72,6 +78,8 @@ if [[ -n "$LLAMA_SERVER" ]]; then
     unset _server_dir _build_root _lib_paths
 fi
 
+# Note: --server-bin and --lib-path are applied after arg parsing (see below)
+
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -82,8 +90,11 @@ while [[ $# -gt 0 ]]; do
         --cpu)       CPU_ONLY=1; shift ;;
         --port)      PORT="$2"; shift 2 ;;
         --ctx-size)  CTX_SIZE="$2"; shift 2 ;;
-        --model-dir) MODEL_DIR="$2"; shift 2 ;;
-        --version)   echo "llm-server v$VERSION"; exit 0 ;;
+        --model-dir)   MODEL_DIR="$2"; shift 2 ;;
+        --server-bin)  USER_SERVER_BIN="$2"; shift 2 ;;
+        --lib-path)    USER_LIB_PATH="$2"; shift 2 ;;
+        --kv-quality)  KV_QUALITY="$2"; shift 2 ;;
+        --version)     echo "llm-server v$VERSION"; exit 0 ;;
         --help|-h)
             sed -n '2,/^$/s/^# \?//p' "$0"
             exit 0
@@ -107,14 +118,45 @@ if [[ ! -f "$MODEL_ARG" ]]; then
     fi
 fi
 
+MODEL_PATH="$MODEL_ARG"
+MODEL_NAME="$(basename "$MODEL_PATH")"
+
+# Apply --server-bin override (before binary check so it can provide the binary)
+if [[ -n "$USER_SERVER_BIN" ]]; then
+    if [[ ! -x "$USER_SERVER_BIN" ]]; then
+        echo "Error: --server-bin binary not found or not executable: $USER_SERVER_BIN"
+        exit 1
+    fi
+    LLAMA_SERVER="$USER_SERVER_BIN"
+    # Re-derive library paths from new binary location
+    _server_dir="$(dirname "$LLAMA_SERVER")"
+    _build_root="${_server_dir%/bin}"
+    _lib_paths="$_server_dir"
+    while IFS= read -r d; do
+        _lib_paths="$_lib_paths:$d"
+    done < <(find "$_build_root" -name '*.so' -printf '%h\n' 2>/dev/null | sort -u)
+    export LD_LIBRARY_PATH="${_lib_paths}:${LD_LIBRARY_PATH:-}"
+    unset _server_dir _build_root _lib_paths
+fi
+
 if [[ -z "$LLAMA_SERVER" ]]; then
     echo "Error: llama-server binary not found."
-    echo "Set LLAMA_SERVER env var or install ik_llama.cpp / llama.cpp."
+    echo "Set LLAMA_SERVER env var, use --server-bin, or install ik_llama.cpp / llama.cpp."
     exit 1
 fi
 
-MODEL_PATH="$MODEL_ARG"
-MODEL_NAME="$(basename "$MODEL_PATH")"
+# Apply --lib-path override (prepend to LD_LIBRARY_PATH)
+if [[ -n "$USER_LIB_PATH" ]]; then
+    export LD_LIBRARY_PATH="${USER_LIB_PATH}:${LD_LIBRARY_PATH:-}"
+fi
+
+# Detect if we're running ik_llama.cpp (supports --split-mode graph)
+IS_IK_LLAMA=0
+if [[ "$LLAMA_SERVER" == *ik_llama* ]]; then
+    IS_IK_LLAMA=1
+elif timeout 5 "$LLAMA_SERVER" --help 2>&1 | grep -q 'graph' 2>/dev/null; then
+    IS_IK_LLAMA=1
+fi
 
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 
@@ -126,6 +168,7 @@ log() { [[ "$VERBOSE" == "1" ]] && echo "[DEBUG] $*" >&2 || true; }
 
 echo "═══ llm-server v$VERSION ═══"
 echo "Binary: $LLAMA_SERVER"
+(( IS_IK_LLAMA )) && echo "Backend: ik_llama.cpp (graph split enabled)"
 
 # Detect physical CPU cores
 PHYSICAL_CORES=$(lscpu 2>/dev/null | awk '/^Core\(s\) per socket:/ {cores=$NF} /^Socket\(s\):/ {socks=$NF} END {print cores * socks}')
@@ -316,36 +359,36 @@ else
     echo "  GPU+CPU split → batch=$BATCH ubatch=$UBATCH"
 fi
 
-# ── KV cache type: use q8_0 if VRAM allows, q4_0 otherwise ──
-# q8_0 is ~2x bigger but noticeably better quality for long contexts
-# KV cache size estimate: ctx * layers * kv_heads * (key+val) * bytes_per_element / 1MB
+# ── KV cache type: high=f16, mid=q8_0 (default), low=q4_0, auto=fit-based ──
+# KV cache size estimates per type
 if (( HEAD_COUNT_KV > 0 && KEY_LENGTH > 0 && VALUE_LENGTH > 0 )); then
     KV_Q4_MB=$(awk "BEGIN {printf \"%.0f\", $CTX_SIZE * $LAYER_COUNT * $HEAD_COUNT_KV * ($KEY_LENGTH + $VALUE_LENGTH) * 0.5 / 1048576}")
     KV_Q8_MB=$(awk "BEGIN {printf \"%.0f\", $CTX_SIZE * $LAYER_COUNT * $HEAD_COUNT_KV * ($KEY_LENGTH + $VALUE_LENGTH) * 1.0 / 1048576}")
+    KV_F16_MB=$(awk "BEGIN {printf \"%.0f\", $CTX_SIZE * $LAYER_COUNT * $HEAD_COUNT_KV * ($KEY_LENGTH + $VALUE_LENGTH) * 2.0 / 1048576}")
 else
     KV_Q4_MB=$(( LAYER_COUNT * 70 ))
     KV_Q8_MB=$(( LAYER_COUNT * 140 ))
+    KV_F16_MB=$(( LAYER_COUNT * 280 ))
 fi
 
-KV_TYPE="q4_0"
-if (( FITS_ON_GPU )); then
-    # Check if q8_0 KV cache fits with the model in VRAM
-    VRAM_WITH_Q8=$(( TOTAL_SIZE_MB * 130 / 100 + KV_Q8_MB ))
-    if (( VRAM_WITH_Q8 < TOTAL_VRAM_MB )); then
+case "$KV_QUALITY" in
+    high)
+        KV_TYPE="f16"
+        echo "  KV cache: f16 (${KV_F16_MB}MB) — highest quality"
+        ;;
+    mid)
         KV_TYPE="q8_0"
-        echo "  VRAM sufficient for q8_0 KV cache (${KV_Q8_MB}MB) → better quality"
-    else
-        echo "  KV cache: q4_0 (${KV_Q4_MB}MB) — q8_0 wouldn't fit"
-    fi
-else
-    # For offload: check if RAM can handle q8_0
-    if (( RAM_AFTER_LOAD > KV_Q8_MB + 8192 )); then
-        KV_TYPE="q8_0"
-        echo "  RAM sufficient for q8_0 KV cache (${KV_Q8_MB}MB) → better quality"
-    else
-        echo "  KV cache: q4_0 (${KV_Q4_MB}MB) — RAM too tight for q8_0"
-    fi
-fi
+        echo "  KV cache: q8_0 (${KV_Q8_MB}MB) — balanced (default)"
+        ;;
+    low)
+        KV_TYPE="q4_0"
+        echo "  KV cache: q4_0 (${KV_Q4_MB}MB) — minimum VRAM"
+        ;;
+    *)
+        echo "Error: --kv-quality must be one of: high, mid, low"
+        exit 1
+        ;;
+esac
 
 # ── Hadamard K-cache: only useful with quantized KV cache ──
 KHAD_FLAG=""
@@ -383,7 +426,6 @@ COMMON_FLAGS=(
     --ctx-size "$CTX_SIZE"
     # Attention
     --flash-attn on
-    -mqkv
     # Batch sizes (dynamic)
     -b "$BATCH"
     -ub "$UBATCH"
@@ -411,12 +453,9 @@ if (( IS_MOE == 1 )); then
     echo "  MoE model → -muge -ger enabled"
 fi
 
-# GPU flags
+# GPU flags (split mode is added per-strategy, not here)
 if (( GPU_COUNT > 0 )); then
-    COMMON_FLAGS+=(-ngl 999)
-    if (( GPU_COUNT > 1 )); then
-        COMMON_FLAGS+=(-mg "${GPU_INDEX[${GPU_ORDER[0]}]}" --split-mode layer)
-    fi
+    COMMON_FLAGS+=(-ngl 999 -mqkv)  # mqkv auto-disabled by ik_llama when using graph split
 fi
 
 # ═══════════════════════════════════════════════════════════════
@@ -631,7 +670,7 @@ run_with_restart() {
     while true; do
         last_start=$(date +%s)
         echo "Starting server (PID will follow)..."
-        "$LLAMA_SERVER" "${flags[@]}" 2>&1 | tee "$SERVER_LOG" &
+        "$LLAMA_SERVER" "${flags[@]}" 2>&1 | tee "$SERVER_LOG" | grep -v --line-buffered "record AND rewind is invalid" &
         local pid=$!
         echo "Server PID: $pid"
 
@@ -692,8 +731,8 @@ run_with_restart() {
         # Reset backoff since the config itself works
         if (( uptime > 60 )); then
             wait_sec=2
-            restarts=1  # don't count long-running crashes against limit as harshly
-            echo "Runtime crash (ran ${uptime}s). Quick restart in ${wait_sec}s..."
+            # Still count runtime crashes — don't loop forever
+            echo "Runtime crash (ran ${uptime}s). Restart $restarts/$MAX_RESTARTS in ${wait_sec}s..."
         else
             echo "Startup crash. Restart $restarts/$MAX_RESTARTS in ${wait_sec}s..."
         fi
@@ -764,23 +803,81 @@ case "$STRATEGY" in
             TS="${TS:+$TS,}$w"
         done
         echo "Tensor split: $TS"
-        # Row split parallelizes matmuls across GPUs (faster than layer split for dense models)
-        LAUNCH_FLAGS=("${COMMON_FLAGS[@]}" --split-mode row --tensor-split "$TS")
-        if (( DRY_RUN )); then
-            print_cmd "${LAUNCH_FLAGS[@]}"
-            exit 0
+        if (( IS_IK_LLAMA )); then
+            GRAPH_EXTRA=(--split-mode graph --tensor-split "$TS")
+            LAYER_EXTRA=(--split-mode layer --tensor-split "$TS")
+            if (( DRY_RUN )); then
+                print_cmd "${COMMON_FLAGS[@]}" "${GRAPH_EXTRA[@]}"
+                exit 0
+            fi
+            echo "Trying graph split (fastest)..."
+            if try_start "${GRAPH_EXTRA[@]}"; then
+                echo "  Graph split works — restarting with crash recovery..."
+                kill_server "$RUNNING_PID"
+                run_with_restart "${COMMON_FLAGS[@]}" "${GRAPH_EXTRA[@]}"
+            else
+                echo "  Graph split failed — retrying with NCCL_P2P_DISABLE=1..."
+                kill_server ""
+                export NCCL_P2P_DISABLE=1
+                if try_start "${GRAPH_EXTRA[@]}"; then
+                    echo "  Graph split works with P2P disabled — restarting with crash recovery..."
+                    kill_server "$RUNNING_PID"
+                    run_with_restart "${COMMON_FLAGS[@]}" "${GRAPH_EXTRA[@]}"
+                else
+                    echo "  Graph split unavailable — falling back to layer split"
+                    kill_server ""
+                    unset NCCL_P2P_DISABLE
+                    run_with_restart "${COMMON_FLAGS[@]}" "${LAYER_EXTRA[@]}"
+                fi
+            fi
+        else
+            # Row split parallelizes matmuls across GPUs (faster than layer split for dense models)
+            LAUNCH_FLAGS=("${COMMON_FLAGS[@]}" --split-mode row --tensor-split "$TS")
+            if (( DRY_RUN )); then
+                print_cmd "${LAUNCH_FLAGS[@]}"
+                exit 0
+            fi
+            run_with_restart "${LAUNCH_FLAGS[@]}"
         fi
-        run_with_restart "${LAUNCH_FLAGS[@]}"
         ;;
 
     dense_cpu_offload)
         echo "Dense model with CPU offload"
-        LAUNCH_FLAGS=("${COMMON_FLAGS[@]}" --no-mmap)
-        if (( DRY_RUN )); then
-            print_cmd "${LAUNCH_FLAGS[@]}"
-            exit 0
+        if (( IS_IK_LLAMA && GPU_COUNT > 1 )); then
+            GRAPH_EXTRA=(--split-mode graph --no-mmap)
+            LAYER_EXTRA=(--no-mmap)
+            if (( DRY_RUN )); then
+                print_cmd "${COMMON_FLAGS[@]}" "${GRAPH_EXTRA[@]}"
+                exit 0
+            fi
+            echo "Trying graph split (fastest)..."
+            if try_start "${GRAPH_EXTRA[@]}"; then
+                echo "  Graph split works — restarting with crash recovery..."
+                kill_server "$RUNNING_PID"
+                run_with_restart "${COMMON_FLAGS[@]}" "${GRAPH_EXTRA[@]}"
+            else
+                echo "  Graph split failed — retrying with NCCL_P2P_DISABLE=1..."
+                kill_server ""
+                export NCCL_P2P_DISABLE=1
+                if try_start "${GRAPH_EXTRA[@]}"; then
+                    echo "  Graph split works with P2P disabled — restarting with crash recovery..."
+                    kill_server "$RUNNING_PID"
+                    run_with_restart "${COMMON_FLAGS[@]}" "${GRAPH_EXTRA[@]}"
+                else
+                    echo "  Graph split unavailable — falling back to layer split"
+                    kill_server ""
+                    unset NCCL_P2P_DISABLE
+                    run_with_restart "${COMMON_FLAGS[@]}" "${LAYER_EXTRA[@]}"
+                fi
+            fi
+        else
+            LAUNCH_FLAGS=("${COMMON_FLAGS[@]}" --no-mmap)
+            if (( DRY_RUN )); then
+                print_cmd "${LAUNCH_FLAGS[@]}"
+                exit 0
+            fi
+            run_with_restart "${LAUNCH_FLAGS[@]}"
         fi
-        run_with_restart "${LAUNCH_FLAGS[@]}"
         ;;
 
     moe_offload)
