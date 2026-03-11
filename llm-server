@@ -57,6 +57,19 @@ find_server_binary() {
 
 LLAMA_SERVER="$(find_server_binary)"
 
+# Ensure shared libraries are found (e.g. libmtmd.so built in sibling dirs)
+if [[ -n "$LLAMA_SERVER" ]]; then
+    _server_dir="$(dirname "$LLAMA_SERVER")"
+    _build_root="${_server_dir%/bin}"
+    _lib_paths="$_server_dir"
+    # Add all directories containing .so files under the build root
+    while IFS= read -r d; do
+        _lib_paths="$_lib_paths:$d"
+    done < <(find "$_build_root" -name '*.so' -printf '%h\n' 2>/dev/null | sort -u)
+    export LD_LIBRARY_PATH="${_lib_paths}:${LD_LIBRARY_PATH:-}"
+    unset _server_dir _build_root _lib_paths
+fi
+
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case "$1" in
