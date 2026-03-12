@@ -33,6 +33,12 @@ VERSION="1.0.0"
 PORT="${LLM_PORT:-8081}"
 HOST="0.0.0.0"
 CTX_SIZE="${LLM_CTX_SIZE:-65536}"
+
+# Persistent Configuration
+CONFIG_DIR="$HOME/.config/llm-server"
+CONFIG_FILE="$CONFIG_DIR/config.sh"
+[[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+
 MODEL_DIR="${LLM_MODEL_DIR:-$HOME/ai_models}"
 # Ensure model directory exists
 mkdir -p "$MODEL_DIR"
@@ -166,9 +172,9 @@ if (( DOWNLOAD )); then
         # If it's a repo name, we'll try to automate it slightly by passing it
         # Note: The current python script is interactive, so we just run it.
         # User hints: The script might need hf_hub_download to be installed.
-        python3 "$DOWNLOADER" --repo "$MODEL_ARG" --vram "$TOTAL_VRAM_MB" --ram "$RAM_AVAIL_MB"
+        python3 "$DOWNLOADER" --repo "$MODEL_ARG" --dir "$MODEL_DIR" --vram "$TOTAL_VRAM_MB" --ram "$RAM_AVAIL_MB"
     else
-        python3 "$DOWNLOADER" --repo "$MODEL_ARG" --vram "$TOTAL_VRAM_MB" --ram "$RAM_AVAIL_MB"
+        python3 "$DOWNLOADER" --repo "$MODEL_ARG" --dir "$MODEL_DIR" --vram "$TOTAL_VRAM_MB" --ram "$RAM_AVAIL_MB"
     fi
     
     echo ""

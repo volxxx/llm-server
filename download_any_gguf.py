@@ -231,15 +231,21 @@ def get_model_files(repo, selected_quantization):
         return []
 
 
-def get_download_directory():
+def get_download_directory(default_path=None):
     """Get or create download directory"""
-    default_dir = Path.home() / "ai_models"
+    if default_path:
+        default_dir = Path(default_path)
+    else:
+        default_dir = Path.home() / "ai_models"
 
-    print(f"\n📁 Default download directory: {default_dir}")
-    print("   This will create a folder named after the model")
+    print(f"\n📁 Download directory: {default_dir}")
+
+    if default_path:
+        # If passed from llm-server, just use it without asking
+        return default_dir
 
     while True:
-        choice = input("Use default? (y/n): ").strip().lower()
+        choice = input("Use this directory? (y/n): ").strip().lower()
         if choice in ["y", ""]:
             return default_dir
         elif choice == "n":
@@ -528,7 +534,7 @@ def main():
             print(f"   • ... and {len(files_to_download) - 5} more")
 
         # Get download directory
-        output_dir = get_download_directory()
+        output_dir = get_download_directory(args.dir)
         # Save directly to output_dir without subfolders
 
         # Confirm
