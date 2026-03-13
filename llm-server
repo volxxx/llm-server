@@ -434,20 +434,7 @@ for i in $(seq 0 $(( GPU_COUNT - 1 ))); do
     (( GPU_VRAM_FREE[$i] > BEST_GPU_VRAM )) && BEST_GPU_VRAM=${GPU_VRAM_FREE[$i]}
 done
 
-# ── Memory Safety Check ──
-TOTAL_MEM_MB=$(( TOTAL_VRAM_MB + RAM_AVAIL_MB ))
-# Estimate KV cache based on ctx size and model layers (rough proxy for memory overhead)
-KV_EST_MB=$(( CTX_SIZE * LAYER_COUNT / 1024 )) 
-ESTIMATED_TOTAL_NEEDED=$(( TOTAL_SIZE_MB + KV_EST_MB + 5120 )) # Model + KV + 5GB system headroom
-
-if (( TOTAL_SIZE_MB > TOTAL_MEM_MB )); then
-    echo "CRITICAL ERROR: Model (${TOTAL_SIZE_GB}GB) is larger than your total memory (${TOTAL_MEM_MB}MB)."
-    echo "This will cause a system crash. Please use a smaller quantization."
-    exit 1
-elif (( ESTIMATED_TOTAL_NEEDED > TOTAL_MEM_MB )); then
-    echo "WARNING: Model + KV Cache (~${ESTIMATED_TOTAL_NEEDED}MB) is very close to your total memory (${TOTAL_MEM_MB}MB)."
-    echo "Expect potential instability or slow swap performance."
-fi
+# (Memory Safety Check disabled by user request — YOLO mode enabled)
 
 FITS_ON_GPU=0
 (( TOTAL_SIZE_MB * 130 / 100 <= TOTAL_VRAM_MB )) && FITS_ON_GPU=1
@@ -637,13 +624,19 @@ echo "Strategy: $STRATEGY"
 # Args: pairs of "CUDA_INDEX LAYER_START LAYER_COUNT" followed by end marker
 build_ot_string() {
     local parts=()
+    # Fused models use different tensor names for experts
+    local up_gate_pattern="ffn_(gate|up|down)_exps"
+    if (( HAS_FUSED == 1 )); then
+        up_gate_pattern="ffn_(up_gate|down)_exps"
+    fi
+
     while [[ $# -ge 3 ]]; do
         local cuda_idx=$1 layer_start=$2 layer_count=$3
         shift 3
         if (( layer_count > 0 )); then
             local last=$(( layer_start + layer_count - 1 ))
             local re=$(seq "$layer_start" "$last" | tr '\n' '|' | sed 's/|$//')
-            parts+=("blk\\.(${re})\\.ffn_(gate|up|down)_exps.*=CUDA${cuda_idx}")
+            parts+=("blk\\.(${re})\\.${up_gate_pattern}.*=CUDA${cuda_idx}")
         fi
     done
     parts+=("exps=CPU")
