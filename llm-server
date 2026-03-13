@@ -29,7 +29,7 @@ set -euo pipefail
 # Section 1: Configuration & Argument Parsing
 # ═══════════════════════════════════════════════════════════════
 
-VERSION="1.0.0"
+VERSION="2.0.0"
 PORT="${LLM_PORT:-8081}"
 HOST="0.0.0.0"
 CTX_SIZE="${LLM_CTX_SIZE:-65536}"
@@ -323,12 +323,46 @@ TOTAL_SIZE_MB=$(awk "BEGIN {printf \"%.0f\", $TOTAL_SIZE_BYTES/1048576}")
 TOTAL_SIZE_GB=$(awk "BEGIN {printf \"%.1f\", $TOTAL_SIZE_BYTES/1073741824}")
 
 # Read GGUF metadata
-read LAYER_COUNT EXPERT_COUNT HEAD_COUNT_KV KEY_LENGTH VALUE_LENGTH HAS_SSM HAS_FUSED < <(python3 -c "
-import struct
-r = {}
-with open('$MODEL_PATH', 'rb') as f:
-    f.read(4); f.read(4); f.read(8)
-    kv_count = struct.unpack('<Q', f.read(8))[0]
+read LAYER_COUNT EXPERT_COUNT HEAD_COUNT_KV KEY_LENGTH VALUE_LENGTH HAS_SSM HAS_FUSED EXPERT_BYTES NON_EXPERT_BYTES < <(python3 -c "
+import struct, sys, glob, os, re
+
+# GGUF type -> (bytes_per_block, elements_per_block) from ggml.h struct sizes
+GGUF_TYPE_SIZE = {
+    0:  (4, 1),       # F32
+    1:  (2, 1),       # F16
+    2:  (18, 32),     # Q4_0
+    3:  (20, 32),     # Q4_1
+    6:  (22, 32),     # Q5_0
+    7:  (24, 32),     # Q5_1
+    8:  (34, 32),     # Q8_0
+    9:  (36, 32),     # Q8_1
+    10: (84, 256),    # Q2_K
+    11: (110, 256),   # Q3_K
+    12: (144, 256),   # Q4_K
+    13: (176, 256),   # Q5_K
+    14: (210, 256),   # Q6_K
+    15: (292, 256),   # Q8_K
+    16: (66, 256),    # IQ2_XXS
+    17: (74, 256),    # IQ2_XS
+    18: (98, 256),    # IQ3_XXS
+    19: (50, 256),    # IQ1_S
+    20: (18, 32),     # IQ4_NL
+    21: (110, 256),   # IQ3_S
+    22: (82, 256),    # IQ2_S
+    23: (136, 256),   # IQ4_XS
+    24: (56, 256),    # IQ1_M
+    25: (2, 1),       # BF16
+    26: (18, 32),     # Q4_0_4_4
+    27: (18, 32),     # Q4_0_4_8
+    28: (18, 32),     # Q4_0_8_8
+    29: (40, 256),    # TQ1_0
+    30: (54, 256),    # TQ2_0
+    31: (1, 1),       # I8
+}
+
+r = {'fused': 0, 'expert_bytes': 0, 'non_expert_bytes': 0}
+
+def skip_kv(f, kv_count):
     for _ in range(kv_count):
         kl = struct.unpack('<Q', f.read(8))[0]
         key = f.read(kl).decode('utf-8', errors='replace')
@@ -348,44 +382,67 @@ with open('$MODEL_PATH', 'rb') as f:
         elif vt in (2, 3): f.read(2)
         elif vt == 10: f.read(8)
         elif vt == 9:
-            at = struct.unpack('<I', f.read(4))[0]
-            al = struct.unpack('<Q', f.read(8))[0]
+            at = struct.unpack('<I', f.read(4))[0]; al = struct.unpack('<Q', f.read(8))[0]
             s = {0:1,1:1,2:2,3:2,4:4,5:4,6:4,7:1,10:8}
             if at in s: f.read(al * s[at])
             elif at == 8:
                 for _ in range(al): f.read(struct.unpack('<Q', f.read(8))[0])
         else: break
-    # Check for fused tensors (quick scan of tensor names)
-    r['fused'] = 0
-    try:
-        f.seek(0)
-        f.read(4); f.read(4); f.read(8) # magic, version, kv_count
-        kv_count = struct.unpack('<Q', f.read(8))[0]
-        for _ in range(kv_count):
-            kl = struct.unpack('<Q', f.read(8))[0]; f.read(kl); vt = struct.unpack('<I', f.read(4))[0]
-            if vt == 4: f.read(4)
-            elif vt == 8: f.read(struct.unpack('<Q', f.read(8))[0])
-            elif vt in (5, 6): f.read(4)
-            elif vt == 7: f.read(1)
-            elif vt in (0, 1): f.read(1)
-            elif vt in (2, 3): f.read(2)
-            elif vt == 10: f.read(8)
-            elif vt == 9:
-                at = struct.unpack('<I', f.read(4))[0]; al = struct.unpack('<Q', f.read(8))[0]
-                s = {0:1,1:1,2:2,3:2,4:4,5:4,6:4,7:1,10:8}
-                if at in s: f.read(al * s[at])
-                elif at == 8:
-                    for _ in range(al): f.read(struct.unpack('<Q', f.read(8))[0])
+
+def read_tensors(f, tensor_count):
+    for _ in range(tensor_count):
+        tl = struct.unpack('<Q', f.read(8))[0]
+        tname = f.read(tl).decode('utf-8', errors='replace')
+        if 'ffn_up_gate' in tname: r['fused'] = 1
+        n_dims = struct.unpack('<I', f.read(4))[0]
+        dims = [struct.unpack('<Q', f.read(8))[0] for _ in range(n_dims)]
+        ttype = struct.unpack('<I', f.read(4))[0]
+        f.read(8)  # offset
+        n_elements = 1
+        for d in dims: n_elements *= d
+        if ttype in GGUF_TYPE_SIZE:
+            bpb, epb = GGUF_TYPE_SIZE[ttype]
+            n_blocks = (n_elements + epb - 1) // epb
+            tbytes = n_blocks * bpb
+        else:
+            tbytes = n_elements * 2
+        is_expert = '_exps.' in tname or '_shexp.' in tname or 'experts.' in tname
+        if is_expert:
+            r['expert_bytes'] += tbytes
+        else:
+            r['non_expert_bytes'] += tbytes
+
+try:
+    model_path = '$MODEL_PATH'
+    with open(model_path, 'rb') as f:
+        magic = f.read(4)
+        if magic != b'GGUF': sys.exit(1)
+        f.read(4)  # version
         tensor_count = struct.unpack('<Q', f.read(8))[0]
-        for _ in range(min(tensor_count, 1000)): # Scan first 1000 tensors
-            tl = struct.unpack('<Q', f.read(8))[0]
-            tname = f.read(tl).decode('utf-8', errors='replace')
-            if 'ffn_up_gate' in tname: r['fused'] = 1; break
-            n_dims = struct.unpack('<I', f.read(4))[0]
-            f.read(n_dims * 8 + 4 + 8)
-    except: pass
-print(r.get('layers',0), r.get('experts',0), r.get('hkv',0), r.get('kl',0), r.get('vl',0), r.get('ssm',0), r.get('fused',0))
-" 2>/dev/null || echo "0 0 0 0 0 0 0")
+        kv_count = struct.unpack('<Q', f.read(8))[0]
+        skip_kv(f, kv_count)
+        read_tensors(f, tensor_count)
+
+    # For split GGUFs: if primary shard has no tensors, scan sibling shards
+    if tensor_count == 0:
+        m = re.search(r'-(\d+)-of-(\d+)\.gguf$', model_path)
+        if m:
+            total_shards = int(m.group(2))
+            base = model_path[:m.start()]
+            for shard_num in range(2, total_shards + 1):
+                shard_path = f'{base}-{shard_num:05d}-of-{total_shards:05d}.gguf'
+                if not os.path.exists(shard_path): continue
+                with open(shard_path, 'rb') as f:
+                    magic = f.read(4)
+                    if magic != b'GGUF': continue
+                    f.read(4)
+                    tc = struct.unpack('<Q', f.read(8))[0]
+                    kvc = struct.unpack('<Q', f.read(8))[0]
+                    skip_kv(f, kvc)
+                    read_tensors(f, tc)
+except: pass
+print(r.get('layers',0), r.get('experts',0), r.get('hkv',0), r.get('kl',0), r.get('vl',0), r.get('ssm',0), r.get('fused',0), r.get('expert_bytes',0), r.get('non_expert_bytes',0))
+" 2>/dev/null || echo "0 0 0 0 0 0 0 0 0")
 
 LAYER_COUNT=${LAYER_COUNT:-0}
 EXPERT_COUNT=${EXPERT_COUNT:-0}
@@ -394,6 +451,8 @@ KEY_LENGTH=${KEY_LENGTH:-0}
 VALUE_LENGTH=${VALUE_LENGTH:-0}
 HAS_SSM=${HAS_SSM:-0}
 HAS_FUSED=${HAS_FUSED:-0}
+EXPERT_BYTES=${EXPERT_BYTES:-0}
+NON_EXPERT_BYTES=${NON_EXPERT_BYTES:-0}
 
 [[ "$LAYER_COUNT" == "0" ]] && LAYER_COUNT=48 && echo "Warning: Could not detect layer count, using default (48)"
 
@@ -638,11 +697,8 @@ echo "Strategy: $STRATEGY"
 # Args: pairs of "CUDA_INDEX LAYER_START LAYER_COUNT" followed by end marker
 build_ot_string() {
     local parts=()
-    # Fused models use different tensor names for experts
-    local up_gate_pattern="ffn_(gate|up|down)_exps"
-    if (( HAS_FUSED == 1 )); then
-        up_gate_pattern="ffn_(up_gate|down)_exps"
-    fi
+    # Support both fused (up_gate) and unfused (gate|up|down) expert tensor names
+    local expert_pattern="ffn_(gate|up|down|up_gate)_exps"
 
     while [[ $# -ge 3 ]]; do
         local cuda_idx=$1 layer_start=$2 layer_count=$3
@@ -650,7 +706,7 @@ build_ot_string() {
         if (( layer_count > 0 )); then
             local last=$(( layer_start + layer_count - 1 ))
             local re=$(seq "$layer_start" "$last" | tr '\n' '|' | sed 's/|$//')
-            parts+=("blk\\.(${re})\\.${up_gate_pattern}.*=CUDA${cuda_idx}")
+            parts+=("blk\\.(${re})\\.${expert_pattern}.*=CUDA${cuda_idx}")
         fi
     done
     parts+=("exps=CPU")
@@ -1038,10 +1094,18 @@ mkdir -p "$CACHE_DIR"
 CACHE_KEY=$(echo "${MODEL_NAME}_${TOTAL_SIZE_BYTES}" | md5sum | awk '{print $1}')
 CACHE_FILE="$CACHE_DIR/${CACHE_KEY}.conf"
 
-# Estimate per-layer expert size (~90% of model is experts in MoE)
-EXPERT_TOTAL_MB=$(awk "BEGIN {printf \"%.0f\", $TOTAL_SIZE_MB * 0.90}")
-EXPERT_PER_LAYER_MB=$(awk "BEGIN {printf \"%.0f\", $EXPERT_TOTAL_MB / $LAYER_COUNT}")
-echo "Expert size per layer: ~${EXPERT_PER_LAYER_MB}MB"
+# Per-layer expert size from GGUF tensor data (fallback: estimate 90%)
+if (( EXPERT_BYTES > 0 )); then
+    EXPERT_TOTAL_MB=$(( EXPERT_BYTES / 1048576 ))
+    NON_EXPERT_TOTAL_MB=$(( NON_EXPERT_BYTES / 1048576 ))
+    EXPERT_PER_LAYER_MB=$(( EXPERT_TOTAL_MB / LAYER_COUNT ))
+    EXPERT_PCT=$(( EXPERT_TOTAL_MB * 100 / TOTAL_SIZE_MB ))
+    echo "Expert size per layer: ${EXPERT_PER_LAYER_MB}MB (${EXPERT_PCT}% expert, from GGUF tensors)"
+else
+    EXPERT_TOTAL_MB=$(awk "BEGIN {printf \"%.0f\", $TOTAL_SIZE_MB * 0.90}")
+    EXPERT_PER_LAYER_MB=$(awk "BEGIN {printf \"%.0f\", $EXPERT_TOTAL_MB / $LAYER_COUNT}")
+    echo "Expert size per layer: ~${EXPERT_PER_LAYER_MB}MB (estimated 90%, no tensor data)"
+fi
 
 # Total KV cache size (model-specific, used for VRAM budgeting)
 if [[ "$KV_TYPE" == "q8_0" ]]; then
@@ -1130,23 +1194,64 @@ done
 LAYERS_CPU=$(( LAYER_COUNT - TOTAL_GPU_LAYERS ))
 
 # RAM safety check
-CPU_EXPERT_MB=$(( LAYERS_CPU * EXPERT_PER_LAYER_MB ))
 if (( HEAD_COUNT_KV > 0 && KEY_LENGTH > 0 && VALUE_LENGTH > 0 )); then
     KV_CACHE_MB=$(awk "BEGIN {printf \"%.0f\", $CTX_SIZE * $LAYER_COUNT * $HEAD_COUNT_KV * ($KEY_LENGTH + $VALUE_LENGTH) * 0.5 / 1048576}")
 else
     KV_CACHE_MB=$(( LAYER_COUNT * 70 ))
 fi
-RAM_NEEDED=$(( CPU_EXPERT_MB + KV_CACHE_MB + 5120 ))
+RAM_OVERHEAD_MB=2048  # OS + llama-server process overhead
+CPU_EXPERT_MB=$(( LAYERS_CPU * EXPERT_PER_LAYER_MB ))
+RAM_NEEDED=$(( CPU_EXPERT_MB + KV_CACHE_MB + RAM_OVERHEAD_MB ))
 
 ACTUAL_CTX=$CTX_SIZE
+
+# Phase 1: If CPU layers would OOM, push layers to GPUs one at a time (least disruption)
+if (( RAM_NEEDED > RAM_AVAIL_MB && LAYERS_CPU > 0 && GPU_COUNT > 0 )); then
+    echo "WARNING: Conservative placement needs ${RAM_NEEDED}MB RAM but only ${RAM_AVAIL_MB}MB available"
+    echo "  Redistributing layers to GPUs to fit in RAM..."
+
+    # Recalculate with increasing GPU budgets until CPU fits in RAM
+    for bump in 80 85 90 95; do
+        NEXT_LAYER=0
+        TOTAL_GPU_LAYERS=0
+        # Build budget array: primary GPU gets bump%, others get slightly less
+        for i in $(seq 0 $(( GPU_COUNT - 1 ))); do
+            gi=${GPU_ORDER[$i]}
+            pct=$(( bump - i * 5 ))
+            (( pct < 30 )) && pct=30
+            available_mb=$(( GPU_VRAM_FREE[$gi] - COMPUTE_PER_GPU_MB ))
+            (( available_mb < 0 )) && available_mb=0
+            budget_mb=$(( available_mb * pct / 100 ))
+            layers=0
+            if (( COST_PER_LAYER_MB > 0 )); then
+                layers=$(( budget_mb / COST_PER_LAYER_MB ))
+            fi
+            remain=$(( LAYER_COUNT - NEXT_LAYER ))
+            (( layers > remain )) && layers=$remain
+            LAYERS_PER_GPU[$gi]=$layers
+            NEXT_LAYER=$(( NEXT_LAYER + layers ))
+            TOTAL_GPU_LAYERS=$(( TOTAL_GPU_LAYERS + layers ))
+        done
+        LAYERS_CPU=$(( LAYER_COUNT - TOTAL_GPU_LAYERS ))
+        CPU_EXPERT_MB=$(( LAYERS_CPU * EXPERT_PER_LAYER_MB ))
+        RAM_NEEDED=$(( CPU_EXPERT_MB + KV_CACHE_MB + RAM_OVERHEAD_MB ))
+        if (( RAM_NEEDED <= RAM_AVAIL_MB )); then
+            echo "  Adjusted GPU budget to ${bump}% — ${LAYERS_CPU} CPU layers (${RAM_NEEDED}MB RAM)"
+            break
+        fi
+    done
+fi
+
+# Phase 2: If still over RAM, reduce context size
 if (( RAM_NEEDED > RAM_AVAIL_MB )); then
     for try_ctx in 32768 16384 8192 4096; do
         kv_at_ctx=$(( KV_CACHE_MB * try_ctx / CTX_SIZE ))
-        needed=$(( CPU_EXPERT_MB + kv_at_ctx + 5120 ))
+        needed=$(( CPU_EXPERT_MB + kv_at_ctx + RAM_OVERHEAD_MB ))
         if (( needed <= RAM_AVAIL_MB )); then
             echo "WARNING: Reducing context from $CTX_SIZE to $try_ctx to fit in RAM"
             ACTUAL_CTX=$try_ctx
-            # Rebuild COMMON_FLAGS with new context
+            KV_CACHE_MB=$kv_at_ctx
+            RAM_NEEDED=$needed
             for idx in "${!COMMON_FLAGS[@]}"; do
                 [[ "${COMMON_FLAGS[$idx]}" == "--ctx-size" ]] && COMMON_FLAGS[$((idx+1))]="$ACTUAL_CTX"
             done
@@ -1249,29 +1354,14 @@ if try_start --no-mmap -ot "$OT_STRING"; then
         # Restart with optimized config
         kill_server "$RUNNING_PID"
         echo ""
-        echo "Restarting with optimized config..."
-        if ! try_start --no-mmap -ot "$OT_STRING"; then
-            echo "  Optimized config failed — falling back..."
-            # Reduce by 1 layer on primary GPU
-            primary=${GPU_ORDER[0]}
-            LAYERS_PER_GPU[$primary]=$(( LAYERS_PER_GPU[$primary] - 1 ))
-            LAYERS_CPU=$(( LAYERS_CPU + 1 ))
-
-            OT_ARGS=()
-            NEXT_LAYER=0
-            for i in $(seq 0 $(( GPU_COUNT - 1 ))); do
-                gi=${GPU_ORDER[$i]}
-                layers=${LAYERS_PER_GPU[$gi]}
-                if (( layers > 0 )); then
-                    OT_ARGS+=("${GPU_INDEX[$gi]}" "$NEXT_LAYER" "$layers")
-                    NEXT_LAYER=$(( NEXT_LAYER + layers ))
-                fi
-            done
-            OT_STRING=$(build_ot_string "${OT_ARGS[@]}")
+        echo "Restarting with optimized config (Gentle Load enabled)..."
+        # --no-mmap is critical for 397B models to prevent virtual memory blowout
+        # --mlock ensures the 100GB+ in RAM doesn't get swapped out
+        if ! try_start --no-mmap --mlock -ot "$OT_STRING"; then
+            echo "  Optimized config failed — retrying without mlock..."
             kill_server ""
             if ! try_start --no-mmap -ot "$OT_STRING"; then
-                echo "FAILED: Could not start server. Check $SERVER_LOG"
-                suggest_alternatives "$VRAM_NEEDED_MB" "$(( TOTAL_VRAM_MB + RAM_AVAIL_MB ))"
+                echo "  FAILED: Could not start server. Check $SERVER_LOG"
                 exit 1
             fi
         fi
