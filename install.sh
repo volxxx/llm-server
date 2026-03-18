@@ -61,14 +61,19 @@ echo "── Checking Dependencies ──"
 # Check for python dependencies
 if command -v python3 >/dev/null 2>&1; then
     echo "  ✓ python3 found"
-    if python3 -c "import huggingface_hub" >/dev/null 2>&1; then
-        echo "  ✓ huggingface_hub found"
+    if python3 -c "import huggingface_hub, tqdm" >/dev/null 2>&1; then
+        echo "  ✓ huggingface_hub and tqdm found"
     else
-        echo "  ⚠ Warning: python3 'huggingface_hub' package not found."
-        echo "    Recommended: pip install huggingface_hub tqdm"
+        echo "  ⚠ Installing Python dependencies..."
+        if python3 -m pip install --user huggingface_hub tqdm >/dev/null 2>&1; then
+            echo "  ✓ Installed huggingface_hub and tqdm"
+        else
+            echo "  ⚠ Warning: pip install failed. Run manually: pip install huggingface_hub tqdm"
+        fi
     fi
 else
-    echo "  ⚠ Error: python3 not found. Downloader will not work."
+    echo "  ✗ Error: python3 not found. Downloader will not work."
+    echo "    Install: apt install python3 python3-pip  OR  brew install python3"
 fi
 
 # Check for GPU acceleration

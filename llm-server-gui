@@ -6,10 +6,15 @@
 # Usage:
 #   llm-server-gui                    # Select from configured model dir
 #   llm-server-gui --model-dir /path  # Custom model directory
-#   llm-server-gui -h                 # Show this help message
+#   llm-server-gui --model /path/to/model.gguf  # Launch specific model
+#   llm-server-gui -h|--help          # Show this help message
+#
+# Examples:
+#   llm-server-gui --model-dir ~/models
+#   llm-server-gui --model ~/models/Qwen3.5.gguf --benchmark
 #
 # Environment:
-#   LLM_MODEL_DIR   Default search path
+#   LLM_MODEL_DIR   Default search path (default: ~/ai_models)
 #
 
 set -euo pipefail
