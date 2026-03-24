@@ -92,8 +92,8 @@ else
 fi
 
 # Check PATH
-SHELL_RC="~/.bashrc"
-[[ "$OS" == "Darwin" ]] && SHELL_RC="~/.zshrc"
+SHELL_RC="$HOME/.bashrc"
+[[ "$OS" == "Darwin" ]] && SHELL_RC="$HOME/.zshrc"
 if ! echo "$PATH" | tr ':' '\n' | grep -qx "$INSTALL_DIR"; then
     echo ""
     echo "  ⚠ WARNING: $INSTALL_DIR is not in your PATH."
