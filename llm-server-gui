@@ -1,4 +1,5 @@
 #!/bin/bash
+# shellcheck disable=SC1090,SC2001
 #
 # llm-server-gui — Terminal model selector for llm-server
 # Lists available GGUF models and launches llm-server with the selected one.
@@ -59,7 +60,7 @@ if [[ ! -d "$MODEL_DIR" || -z "$(ls -A "$MODEL_DIR" 2>/dev/null)" ]]; then
     echo "═══ llm-server First Run Setup ═══"
     echo "No models found in: $MODEL_DIR"
     echo ""
-    read -p "Enter the full path to your model directory: " USER_PATH
+    read -rp "Enter the full path to your model directory: " USER_PATH
     
     # Expand tilde if present
     USER_PATH="${USER_PATH/#\~/$HOME}"

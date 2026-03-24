@@ -1,4 +1,5 @@
 #!/bin/bash
+# shellcheck disable=SC2004,SC1090,SC2034,SC2001,SC2155,SC2086,SC2015,SC2207
 #
 # llm-server — Universal smart launcher for ik_llama.cpp / llama.cpp
 # Auto-detects GPUs, RAM, model architecture (dense/MoE), and optimizes placement.
@@ -384,7 +385,7 @@ fi
 # Get total model size (handles split GGUFs)
 MODEL_DIR_PATH=$(dirname "$MODEL_PATH")
 SPLIT_PATTERN=$(echo "$MODEL_NAME" | sed 's/-[0-9]*-of-[0-9]*\.gguf/.gguf/')
-TOTAL_SIZE_BYTES=$(find "$MODEL_DIR_PATH" -name "${SPLIT_PATTERN%.gguf}*" -type f 2>/dev/null | xargs du -scb 2>/dev/null | tail -1 | awk '{print $1}')
+TOTAL_SIZE_BYTES=$(find "$MODEL_DIR_PATH" -name "${SPLIT_PATTERN%.gguf}*" -type f -print0 2>/dev/null | xargs -0 du -scb 2>/dev/null | tail -1 | awk '{print $1}')
 if [[ -z "$TOTAL_SIZE_BYTES" || "$TOTAL_SIZE_BYTES" == "0" ]]; then
     TOTAL_SIZE_BYTES=$(du -sb "$MODEL_PATH" | awk '{print $1}')
 fi
@@ -392,7 +393,7 @@ TOTAL_SIZE_MB=$(awk "BEGIN {printf \"%.0f\", $TOTAL_SIZE_BYTES/1048576}")
 TOTAL_SIZE_GB=$(awk "BEGIN {printf \"%.1f\", $TOTAL_SIZE_BYTES/1073741824}")
 
 # Read GGUF metadata
-read LAYER_COUNT EXPERT_COUNT HEAD_COUNT_KV KEY_LENGTH VALUE_LENGTH HAS_SSM HAS_FUSED EXPERT_BYTES NON_EXPERT_BYTES < <(MODEL_PATH="$MODEL_PATH" python3 -c "
+read -r LAYER_COUNT EXPERT_COUNT HEAD_COUNT_KV KEY_LENGTH VALUE_LENGTH HAS_SSM HAS_FUSED EXPERT_BYTES NON_EXPERT_BYTES < <(MODEL_PATH="$MODEL_PATH" python3 -c "
 import struct, sys, glob, os, re
 
 # GGUF type -> (bytes_per_block, elements_per_block) from ggml.h struct sizes

@@ -1,4 +1,5 @@
 #!/bin/bash
+# shellcheck disable=SC1090,SC2001,SC2015,SC2034,SC2086
 #
 # llm-server-mac — Smart launcher for llama.cpp on macOS (Apple Silicon)
 # Auto-detects Metal GPU, unified memory, and launches with optimal settings.
@@ -253,7 +254,7 @@ TOTAL_SIZE_MB=$(awk "BEGIN {printf \"%.0f\", $TOTAL_SIZE_BYTES/1048576}")
 TOTAL_SIZE_GB=$(awk "BEGIN {printf \"%.1f\", $TOTAL_SIZE_BYTES/1073741824}")
 
 # Read GGUF metadata (same Python parser — cross-platform)
-read LAYER_COUNT EXPERT_COUNT HEAD_COUNT_KV KEY_LENGTH VALUE_LENGTH HAS_SSM HAS_FUSED EXPERT_BYTES NON_EXPERT_BYTES < <(python3 -c "
+read -r LAYER_COUNT EXPERT_COUNT HEAD_COUNT_KV KEY_LENGTH VALUE_LENGTH HAS_SSM HAS_FUSED EXPERT_BYTES NON_EXPERT_BYTES < <(python3 -c "
 import struct, sys, glob, os, re
 
 # GGUF type sizes: (bytes_per_block, elements_per_block)
