@@ -152,7 +152,41 @@ done
 
 SELECTED="${MODEL_PATHS[$((choice-1))]}"
 echo ""
-echo "Launching: $(basename "$SELECTED")"
+
+# Option toggles (skip with Enter)
+OPT_FLAGS=()
+echo "Options (toggle with letter, Enter to launch):"
+opt_aitune=0; opt_bench=0; opt_vision=0; opt_dryrun=0
+print_opts() {
+    local a="off" b="off" v="off" d="off"
+    (( opt_aitune )) && a="ON"
+    (( opt_bench )) && b="ON"
+    (( opt_vision )) && v="ON"
+    (( opt_dryrun )) && d="ON"
+    printf "  [a] AI Tune %-3s  [b] Benchmark %-3s  [v] Vision %-3s  [d] Dry Run %-3s\r" "$a" "$b" "$v" "$d"
+}
+print_opts
+while true; do
+    read -rsn1 key
+    case "$key" in
+        a|A) (( opt_aitune = !opt_aitune )) || true ;;
+        b|B) (( opt_bench = !opt_bench )) || true ;;
+        v|V) (( opt_vision = !opt_vision )) || true ;;
+        d|D) (( opt_dryrun = !opt_dryrun )) || true ;;
+        "") break ;;
+        *) continue ;;
+    esac
+    printf "\r%80s\r" ""
+    print_opts
+done
 echo ""
 
-exec "$LAUNCHER" "${PASSTHROUGH_ARGS[@]}" "$SELECTED"
+(( opt_aitune )) && OPT_FLAGS+=(--ai-tune)
+(( opt_bench )) && OPT_FLAGS+=(--benchmark)
+(( opt_vision )) && OPT_FLAGS+=(--vision)
+(( opt_dryrun )) && OPT_FLAGS+=(--dry-run)
+
+echo "Launching: $(basename "$SELECTED") ${OPT_FLAGS[*]:-}"
+echo ""
+
+exec "$LAUNCHER" "${PASSTHROUGH_ARGS[@]}" "${OPT_FLAGS[@]+"${OPT_FLAGS[@]}"}" "$SELECTED"

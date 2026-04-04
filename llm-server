@@ -23,6 +23,7 @@
 #   llm-server <model.gguf> --vision           # Auto-detect/download mmproj for vision
 #   llm-server <model.gguf> --mmproj auto      # Same as --vision
 #   llm-server <model.gguf> --mmproj proj.gguf # Enable vision with specific mmproj file
+#   llm-server <model.gguf> --ai-tune         # AI-driven flag tuning (benchmark 6 configs)
 #
 # Environment variables:
 #   LLAMA_SERVER    Path to llama-server binary (auto-detected if not set)
@@ -75,6 +76,7 @@ GPUS_FILTER=""
 RAM_BUDGET_MB=0
 MMPROJ_PATH=""
 DO_UPDATE=0
+DO_AI_TUNE=0
 
 # Cleanup on exit
 cleanup() {
@@ -156,6 +158,7 @@ while [[ $# -gt 0 ]]; do
         --vision)      MMPROJ_PATH="auto"; shift ;;  # alias: auto-detect/download mmproj
         --download)  DOWNLOAD=1; shift ;;
         --update)    DO_UPDATE=1; shift ;;
+        --ai-tune)   DO_AI_TUNE=1; shift ;;
         --version)     echo "llm-server v$VERSION"; exit 0 ;;
         --help|-h)
             sed -n '2,/^$/s/^# \?//p' "$0"
@@ -411,6 +414,16 @@ fi
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 
 log() { [[ "$VERBOSE" == "1" ]] && echo "[DEBUG] $*" >&2 || true; }
+
+# If AI tuning, kill any existing server first so GPU detection sees true free VRAM
+if (( DO_AI_TUNE )); then
+    local_port_pids=$(lsof -t -i:"${PORT}" 2>/dev/null) || true
+    if [[ -n "$local_port_pids" ]]; then
+        echo "Stopping existing server on port ${PORT} for AI tuning..."
+        kill -9 $local_port_pids 2>/dev/null || true
+        sleep 3  # wait for VRAM release
+    fi
+fi
 
 # ═══════════════════════════════════════════════════════════════
 # Section 2: Hardware Detection
@@ -1253,7 +1266,7 @@ kill_server() {
     # Wait for port to free (max 10s)
     local w=0
     while (( w < 10 )) && lsof -i:"${PORT}" >/dev/null 2>&1; do
-        sleep 1; (( w++ ))
+        sleep 1; (( ++w ))
     done
 }
 
@@ -1274,7 +1287,7 @@ try_start() {
         if ! kill -0 "$pid" 2>/dev/null; then
             return 1
         fi
-        sleep 1; (( i++ ))
+        sleep 1; (( ++i ))
     done
     kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null || true
     return 1
@@ -1415,7 +1428,7 @@ run_with_restart() {
                     echo ""
                     echo "═══ CUDA error detected — server is braindead, killing ═══"
                     tail -5 "$SERVER_LOG" 2>/dev/null
-                    kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null || true
+                    kill -9 "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
                     cuda_killed=1
                     break
                 fi
@@ -1426,7 +1439,7 @@ run_with_restart() {
                     echo ""
                     echo "═══ Image decode loop detected ($img_fails failures) — server is stuck, killing ═══"
                     tail -5 "$SERVER_LOG" 2>/dev/null
-                    kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null || true
+                    kill -9 "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
                     cuda_killed=1  # treat same as CUDA kill (recovery, not crash)
                     break
                 fi
@@ -1461,7 +1474,7 @@ run_with_restart() {
             wait "$pid" 2>/dev/null && exit_code=$? || exit_code=$?
         else
             echo "Server failed to become healthy."
-            kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null || true
+            kill -9 "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
             local exit_code=1
         fi
 
@@ -1546,11 +1559,755 @@ run_with_restart() {
 }
 
 # ═══════════════════════════════════════════════════════════════
+# Section 6b: AI Tune — iterative LLM-driven flag optimization
+# ═══════════════════════════════════════════════════════════════
+
+AI_TUNE_ROUNDS=8
+TUNE_HISTORY_FILE="$CACHE_DIR/tune_history.jsonl"
+
+# Append a round result to the persistent history log
+# Args: round gen_tps pp_tps status flags_json
+# Uses: tune_msg_dir, hw_hash, MODEL_NAME (from outer scope)
+append_tune_history() {
+    local round="$1" gen_tps="$2" pp_tps="$3" status="$4" flags_json="$5" config_name="$6"
+    mkdir -p "$CACHE_DIR"
+    echo "$config_name" > "$tune_msg_dir/hist_name.txt"
+    python3 -c "
+import json
+from datetime import datetime
+entry = {
+    'timestamp': datetime.utcnow().isoformat() + 'Z',
+    'model': '${MODEL_NAME}',
+    'hw_hash': '${hw_hash}',
+    'round': ${round},
+    'name': open('${tune_msg_dir}/hist_name.txt').read().strip(),
+    'gen_tps': ${gen_tps},
+    'pp_tps': ${pp_tps},
+    'status': '${status}',
+    'flags': json.loads(open('/dev/stdin').read())
+}
+with open('${TUNE_HISTORY_FILE}', 'a') as f:
+    f.write(json.dumps(entry) + '\n')
+" <<< "$flags_json"
+}
+
+# Load relevant history entries for the system prompt
+# Returns a text summary of past tuning results on this hardware
+load_tune_history() {
+    local hw_hash="$1"
+    if [[ ! -f "$TUNE_HISTORY_FILE" ]]; then
+        echo "(No previous tuning data)"
+        return
+    fi
+    python3 -c "
+import json, sys
+
+hw_hash = '${hw_hash}'
+history = []
+try:
+    for line in open('${TUNE_HISTORY_FILE}'):
+        line = line.strip()
+        if not line: continue
+        try:
+            entry = json.loads(line)
+            history.append(entry)
+        except: pass
+except: pass
+
+if not history:
+    print('(No previous tuning data)')
+    sys.exit(0)
+
+# Group by model
+by_model = {}
+for e in history:
+    model = e.get('model', '?')
+    if model not in by_model:
+        by_model[model] = []
+    by_model[model].append(e)
+
+# Show results: same hardware first, then others
+lines = []
+same_hw = [e for e in history if e.get('hw_hash') == hw_hash]
+diff_hw = [e for e in history if e.get('hw_hash') != hw_hash]
+
+if same_hw:
+    lines.append('## Results on THIS hardware:')
+    # Group by model, show best and worst
+    models_seen = {}
+    for e in same_hw:
+        m = e.get('model', '?')
+        if m not in models_seen:
+            models_seen[m] = []
+        models_seen[m].append(e)
+    for m, entries in models_seen.items():
+        ok = [e for e in entries if e.get('status') == 'ok' and e.get('gen_tps', 0) > 0]
+        crashed = [e for e in entries if e.get('status') == 'crashed']
+        if ok:
+            best = max(ok, key=lambda e: e.get('gen_tps', 0))
+            lines.append(f'  {m}: best={best[\"gen_tps\"]} tok/s ({best[\"name\"]})')
+            # Show the winning flags
+            flags = best.get('flags', {})
+            if flags:
+                flag_str = ' '.join(f'{k} {v}' if v is not True else k for k, v in flags.items())
+                lines.append(f'    flags: {flag_str}')
+        if crashed:
+            crash_names = [e.get('name', '?') for e in crashed[:3]]
+            lines.append(f'  {m}: crashed configs: {', '.join(crash_names)}')
+
+if diff_hw:
+    lines.append('')
+    lines.append('## Results on OTHER hardware (for reference):')
+    models_seen = {}
+    for e in diff_hw:
+        m = e.get('model', '?')
+        if m not in models_seen:
+            models_seen[m] = []
+        models_seen[m].append(e)
+    for m, entries in list(models_seen.items())[:5]:  # limit to 5 models
+        ok = [e for e in entries if e.get('status') == 'ok' and e.get('gen_tps', 0) > 0]
+        if ok:
+            best = max(ok, key=lambda e: e.get('gen_tps', 0))
+            lines.append(f'  {m}: best={best[\"gen_tps\"]} tok/s ({best[\"name\"]})')
+
+# Cap total output to avoid bloating the prompt
+output = '\n'.join(lines[:50])
+print(output if output.strip() else '(No previous tuning data)')
+" 2>/dev/null || echo "(No previous tuning data)"
+}
+
+# Build hardware profile JSON
+build_hw_profile() {
+    local gpu_json="["
+    local i
+    for i in $(seq 0 $(( GPU_COUNT - 1 ))); do
+        (( i > 0 )) && gpu_json+=","
+        gpu_json+="{\"index\":${GPU_INDEX[$i]:-0},\"name\":\"${GPU_NAME[$i]:-}\",\"vram_free_mb\":${GPU_VRAM_FREE[$i]:-0},\"vram_total_mb\":${GPU_VRAM_TOTAL[$i]:-0},\"pcie_width\":${GPU_PCIE_WIDTH[$i]:-0},\"pcie_gen\":${GPU_PCIE_GEN[$i]:-0}}"
+    done
+    gpu_json+="]"
+    cat <<HWEOF
+{
+  "gpu_count": ${GPU_COUNT},
+  "gpus": ${gpu_json},
+  "ram_available_mb": ${RAM_AVAIL_MB:-0},
+  "physical_cores": ${PHYSICAL_CORES:-4}
+}
+HWEOF
+}
+
+# Build model profile JSON
+build_model_profile() {
+    cat <<MPEOF
+{
+  "name": "${MODEL_NAME}",
+  "architecture": "${MODEL_ARCH}",
+  "layers": ${LAYER_COUNT},
+  "experts": ${EXPERT_COUNT},
+  "size_mb": ${TOTAL_SIZE_MB},
+  "kv_heads": ${HEAD_COUNT_KV},
+  "is_moe": ${IS_MOE:-0},
+  "has_fused": ${HAS_FUSED},
+  "backend": "$(if (( IS_IK_LLAMA )); then echo "ik_llama.cpp"; else echo "llama.cpp (mainline)"; fi)"
+}
+MPEOF
+}
+
+# Run a benchmark request and extract gen tok/s from /slots
+# Prints the tok/s to stdout
+bench_gen_tps() {
+    local url="http://127.0.0.1:${PORT}"
+    # Send a completion and extract timings directly from the response
+    local result
+    result=$(curl -sf "$url/v1/chat/completions" \
+        -H "Content-Type: application/json" \
+        --max-time 180 \
+        -d '{"model":"test","messages":[{"role":"system","content":"You are a helpful assistant. /no_think"},{"role":"user","content":"Explain quantum computing in detail, covering qubits, superposition, entanglement, and error correction."}],"max_tokens":200,"temperature":0.1}' \
+        2>/dev/null)
+
+    if [[ -z "$result" ]]; then
+        echo "0 0"
+        return
+    fi
+
+    # Try timings from response (llama.cpp includes these)
+    python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    t = d.get('timings', {})
+    gen = t.get('predicted_per_second', 0)
+    pp = t.get('prompt_per_second', 0)
+    if gen > 0:
+        print(f'{gen:.2f} {pp:.2f}')
+    else:
+        # Fallback: calculate from usage
+        u = d.get('usage', {})
+        print(f'0 0')
+except: print('0 0')
+" <<< "$result" 2>/dev/null || echo "0 0"
+}
+
+# Query /v1/chat/completions with a message array (conversation history)
+# Args: $1 = JSON messages array as string
+# Prints the assistant content to stdout
+query_llm_chat() {
+    local messages_json="$1"
+    local url="http://127.0.0.1:${PORT}"
+
+    local response
+    response=$(curl -sf "$url/v1/chat/completions" \
+        -H "Content-Type: application/json" \
+        --max-time 1800 \
+        -d "{\"messages\":${messages_json},\"max_tokens\":16384,\"temperature\":0.3}" 2>/dev/null) || true
+
+    if [[ -z "$response" ]]; then
+        echo "ERROR"
+        return 0
+    fi
+
+    python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    c = d['choices'][0]['message']
+    # Combine both content and reasoning — JSON config could be in either
+    content = c.get('content', '') or ''
+    reasoning = c.get('reasoning_content', '') or ''
+    # Prefer content if it has JSON, otherwise check reasoning
+    text = content if '{' in content else (reasoning if '{' in reasoning else content)
+    print(text)
+except:
+    print('ERROR')
+" <<< "$response"
+}
+
+# Build fixed flags string (these never change during tuning)
+build_fixed_flags() {
+    echo "-m \"${MODEL_PATH}\" --host \"${HOST}\" --port \"${PORT}\" --ctx-size \"${CTX_SIZE}\""
+}
+
+# Merge fixed flags + LLM override flags into a bash-ready array
+# Args: $1 = JSON object of flag overrides {"--flag": "value", ...}
+# Prints space-separated flags
+merge_tune_flags() {
+    local overrides_json="$1"
+    python3 -c "
+import json, sys, shlex
+
+fixed = {
+    '-m': '${MODEL_PATH}',
+    '--host': '${HOST}',
+    '--port': '${PORT}',
+    '--ctx-size': '${CTX_SIZE}',
+}
+
+overrides = json.loads(sys.stdin.read())
+
+# Start with fixed, add overrides
+flags = dict(fixed)
+for k, v in overrides.items():
+    if k in ('-m', '--host', '--port', '--ctx-size'):
+        continue  # never override fixed flags
+    flags[k] = v
+
+# Build command line
+parts = []
+for k, v in flags.items():
+    parts.append(k)
+    if v is not True and v != '' and v is not None:
+        parts.append(str(v))
+print(' '.join(parts))
+" <<< "$overrides_json"
+}
+
+# Main AI tune function — iterative: benchmark → query → benchmark → query ...
+ai_tune() {
+    mkdir -p "$CACHE_DIR"
+    local tune_cache_key="${MODEL_NAME}_${TOTAL_SIZE_BYTES}_hw$(echo "${GPU_COUNT}_$(for i in $(seq 0 $((GPU_COUNT-1))); do echo -n "${GPU_NAME[$i]}_"; done)" | md5sum | cut -c1-8)"
+    local tune_cache="$CACHE_DIR/tune_${tune_cache_key}.json"
+
+    # Check existing cache (unless --retune)
+    if [[ -f "$tune_cache" && "$RETUNE" == "0" ]]; then
+        echo ""
+        echo "═══ AI Tune: cached result found ═══"
+        python3 -c "
+import json
+d = json.load(open('$tune_cache'))
+b = d.get('best_config', {})
+print(f'  Winner: {b.get(\"name\", \"?\")}')" 2>/dev/null
+        python3 -c "
+import json
+d = json.load(open('$tune_cache'))
+b = d.get('best_config', {})
+print(f'  Gen: {b.get(\"gen_tps\", \"?\")} tok/s  PP: {b.get(\"pp_tps\", \"?\")} tok/s')
+print(f'  Tuned: {d.get(\"tuned_at\", \"?\")}')" 2>/dev/null
+        echo "  Run --ai-tune --retune to re-optimize"
+        echo ""
+        echo "Launching with tuned config..."
+        return 0
+    fi
+
+    echo ""
+    echo "═══════════════════════════════════════════════════"
+    echo "  AI Tune — iterative LLM-driven optimization"
+    echo "  Model: ${MODEL_NAME}"
+    echo "  Rounds: ${AI_TUNE_ROUNDS}"
+    echo "═══════════════════════════════════════════════════"
+    echo ""
+
+    # Hardware hash for history tracking
+    local hw_hash
+    hw_hash=$(echo "${GPU_COUNT}_$(for i in $(seq 0 $((GPU_COUNT-1))); do echo -n "${GPU_NAME[$i]}_"; done)" | md5sum | cut -c1-8)
+
+    # Load past tuning history
+    local tune_history
+    tune_history=$(load_tune_history "$hw_hash")
+
+    # Collect context
+    local help_text
+    help_text=$("$LLAMA_SERVER" --help 2>&1 || true)
+    local hw_profile
+    hw_profile=$(build_hw_profile)
+    local model_profile
+    model_profile=$(build_model_profile)
+    local fixed_flags
+    fixed_flags=$(build_fixed_flags)
+
+    # Temp dir for message passing (avoids shell escaping issues)
+    local tune_msg_dir
+    tune_msg_dir=$(mktemp -d /tmp/llm-tune-msgs.XXXXXX)
+
+    # Current baseline flags description
+    local baseline_flags_desc=""
+    for f in "${COMMON_FLAGS[@]}"; do
+        baseline_flags_desc+="$f "
+    done
+
+    # ── Round 0: Benchmark baseline ──
+    echo "Round 0/${AI_TUNE_ROUNDS}: Benchmarking baseline (heuristic config)..."
+    kill_server ""
+    if ! try_start; then
+        echo "ERROR: Baseline config failed to start"
+        return 1
+    fi
+
+    local bench_result baseline_gen baseline_pp
+    bench_result=$(bench_gen_tps)
+    baseline_gen=$(echo "$bench_result" | awk '{print $1}')
+    baseline_pp=$(echo "$bench_result" | awk '{print $2}')
+    echo "  Baseline: gen=${baseline_gen} tok/s  pp=${baseline_pp} tok/s"
+
+    if [[ "$baseline_gen" == "0" || "$baseline_gen" == "0.00" || -z "$baseline_gen" ]]; then
+        echo "ERROR: Could not measure baseline"
+        kill_server "$RUNNING_PID"
+        rm -rf "$tune_msg_dir"
+        return 1
+    fi
+
+    # Log baseline to history
+    append_tune_history 0 "$baseline_gen" "$baseline_pp" "ok" "{}" "baseline"
+
+    # Build the system prompt (sent once, contains all static context)
+    local system_prompt
+    system_prompt=$(cat <<'SYSEOF'
+You are an expert performance tuner for llama.cpp and ik_llama.cpp inference servers.
+
+Your job: propose server flag configurations that maximize GENERATION tok/s.
+
+# How this works
+- I give you hardware info, model info, the full --help output, and the current config + benchmark results
+- You propose ONE config per round
+- I benchmark it and tell you the results
+- You learn from each result and propose a better config next round
+- We do this for multiple rounds
+
+# Rules
+1. These flags are FIXED by the launcher (do not include them):
+   {fixed_flags}
+2. Return ALL other flags you want as a JSON object: {"--flag": "value", ...}
+3. Boolean flags (no value) use: {"--no-mmap": true, "--mlock": true}
+4. Your response MUST contain a JSON object with these keys:
+   {"name": "short description", "flags": {...}, "reasoning": "why this should be faster"}
+5. Think carefully about VRAM budget — if a config OOMs, use less VRAM next round
+6. Think about GPU topology — PCIe bandwidth matters for multi-GPU
+7. Single GPU is faster than multi-GPU IF the model fits
+SYSEOF
+)
+    # Replace {fixed_flags} placeholder
+    system_prompt="${system_prompt//\{fixed_flags\}/$fixed_flags}"
+
+    # Build the initial user message with all context
+    local initial_context
+    initial_context=$(cat <<CTXEOF
+# Hardware
+${hw_profile}
+
+# Model
+${model_profile}
+
+# Server --help output (FULL — every available flag)
+${help_text}
+
+# Current baseline config
+Flags: ${baseline_flags_desc}
+Benchmark: gen=${baseline_gen} tok/s, pp=${baseline_pp} tok/s
+
+# Performance guide
+- Single GPU > Multi GPU (avoid inter-GPU transfer overhead)
+- graph split > row split > layer split for multi-GPU
+- q4_0 KV saves ~4x VRAM vs f16 (frees room for bigger batch or single-GPU fit)
+- batch 2048-4096 is usually optimal, above 4096 diminishing returns
+- threads for gen = physical cores, hyperthreads don't help
+- --no-mmap needed when model partly on GPU + partly on RAM
+- For ik_llama.cpp: --run-time-repack always helps, -khad improves quantized KV quality for free
+- For ik_llama.cpp MoE: -muge and -ger give 10-20% speedup
+
+# Previous tuning history (learn from past results!)
+${tune_history}
+
+Propose your first config to try. Think about what might beat the baseline. Use the history above to avoid repeating mistakes and build on what worked.
+CTXEOF
+)
+
+    # Write messages to temp files for safe JSON construction
+    echo "$system_prompt" > "$tune_msg_dir/system.txt"
+    echo "$initial_context" > "$tune_msg_dir/context.txt"
+
+    local messages
+    messages=$(python3 -c "
+import json
+msgs = [
+    {'role': 'system', 'content': open('${tune_msg_dir}/system.txt').read()},
+    {'role': 'user', 'content': open('${tune_msg_dir}/context.txt').read()}
+]
+print(json.dumps(msgs))
+")
+
+    # Track all results
+    local all_results="[]"
+    local best_gen="$baseline_gen"
+    local best_pp="$baseline_pp"
+    local best_name="baseline"
+    local best_flags_json="{}"
+
+    # ── Iterative tuning rounds ──
+    local round
+    for round in $(seq 1 "$AI_TUNE_ROUNDS"); do
+        echo ""
+        echo "Round ${round}/${AI_TUNE_ROUNDS}: Querying model for config proposal..."
+
+        # Query the currently running model
+        local llm_response
+        llm_response=$(query_llm_chat "$messages")
+
+        if [[ -z "$llm_response" || "$llm_response" == "ERROR" ]]; then
+            echo "  WARNING: No response from model, skipping round"
+            continue
+        fi
+
+        # Parse the config from LLM response
+        local parsed
+        parsed=$(python3 -c "
+import json, sys, re
+
+text = sys.stdin.read()
+
+# Find JSON object in response
+# Try to find {...} pattern
+matches = list(re.finditer(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', text, re.DOTALL))
+if not matches:
+    print('PARSE_ERROR')
+    sys.exit(0)
+
+# Find the one that has 'flags' key
+for m in matches:
+    try:
+        obj = json.loads(m.group())
+        if 'flags' in obj:
+            print(json.dumps(obj))
+            sys.exit(0)
+    except json.JSONDecodeError:
+        continue
+
+# Fallback: try last match
+try:
+    obj = json.loads(matches[-1].group())
+    print(json.dumps(obj))
+except:
+    print('PARSE_ERROR')
+" <<< "$llm_response")
+
+        if [[ "$parsed" == "PARSE_ERROR" || -z "$parsed" ]]; then
+            echo "  WARNING: Could not parse config from response, skipping"
+            # Add to conversation so LLM knows it failed
+            echo "$llm_response" > "$tune_msg_dir/resp_${round}.txt"
+            messages=$(python3 -c "
+import json, sys
+msgs = json.loads(sys.stdin.read())
+msgs.append({'role': 'assistant', 'content': open('${tune_msg_dir}/resp_${round}.txt').read()})
+msgs.append({'role': 'user', 'content': 'ERROR: Could not parse your response as JSON. Please respond with a JSON object containing \"name\", \"flags\" (object), and \"reasoning\" keys.'})
+print(json.dumps(msgs))
+" <<< "$messages")
+            continue
+        fi
+
+        local config_name config_reasoning config_flags_json
+        config_name=$(echo "$parsed" | python3 -c "import sys,json; print(json.load(sys.stdin).get('name','config_${round}'))")
+        config_reasoning=$(echo "$parsed" | python3 -c "import sys,json; print(json.load(sys.stdin).get('reasoning',''))")
+        config_flags_json=$(echo "$parsed" | python3 -c "import sys,json; print(json.dumps(json.load(sys.stdin).get('flags',{})))")
+
+        echo "  Config: ${config_name}"
+        echo "  Reason: ${config_reasoning}"
+
+        # Merge fixed flags + LLM overrides
+        local merged_flags
+        merged_flags=$(merge_tune_flags "$config_flags_json")
+        echo "  Flags: ${merged_flags}"
+
+        # Add assistant response to conversation
+        echo "$llm_response" > "$tune_msg_dir/resp_${round}.txt"
+        messages=$(python3 -c "
+import json, sys
+msgs = json.loads(sys.stdin.read())
+msgs.append({'role': 'assistant', 'content': open('${tune_msg_dir}/resp_${round}.txt').read()})
+print(json.dumps(msgs))
+" <<< "$messages")
+
+        # Kill current server, start with new config
+        kill_server "$RUNNING_PID"
+        sleep 1
+
+        # Start server with merged flags
+        local flag_array
+        # shellcheck disable=SC2206
+        flag_array=($merged_flags)
+
+        RUNNING_PID=""
+        (set +e; "$LLAMA_SERVER" "${flag_array[@]}" 2>&1 | tee -a "$SERVER_LOG") &
+        local pid=$!
+        local healthy=0
+        local i=0
+        while (( i < HEALTH_TIMEOUT )); do
+            if curl -sf "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
+                healthy=1
+                RUNNING_PID=$pid
+                break
+            fi
+            if ! kill -0 "$pid" 2>/dev/null; then break; fi
+            sleep 1; (( ++i ))
+        done
+
+        local round_gen="0" round_pp="0" round_status="ok"
+
+        if (( ! healthy )); then
+            echo "  CRASHED — config failed to start"
+            kill -9 "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
+            kill_server ""
+            round_status="crashed"
+
+            # Restart with baseline to query for next round
+            echo "  Restarting baseline for next query..."
+            try_start || { echo "ERROR: Can't restart baseline"; break; }
+        else
+            # Benchmark this config
+            echo "  Benchmarking..."
+            bench_result=$(bench_gen_tps)
+            round_gen=$(echo "$bench_result" | awk '{print $1}')
+            round_pp=$(echo "$bench_result" | awk '{print $2}')
+
+            local delta improvement
+            delta=$(python3 -c "print(f'{${round_gen} - ${baseline_gen}:.2f}')")
+            improvement=$(python3 -c "g=${baseline_gen}; print(f'{(${round_gen}-g)/g*100:.1f}' if g>0 else '0')")
+
+            if python3 -c "exit(0 if ${round_gen} > ${best_gen} else 1)"; then
+                echo "  ★ NEW BEST: gen=${round_gen} tok/s (+${improvement}%)  pp=${round_pp} tok/s"
+                best_gen="$round_gen"
+                best_pp="$round_pp"
+                best_name="$config_name"
+                best_flags_json="$config_flags_json"
+            else
+                echo "  Result: gen=${round_gen} tok/s (${improvement}%)  pp=${round_pp} tok/s"
+            fi
+
+            # Kill tested config, restart baseline for next query
+            kill_server "$RUNNING_PID"
+            sleep 1
+            echo "  Restarting baseline for next query..."
+            try_start || { echo "ERROR: Can't restart baseline after benchmark"; break; }
+        fi
+
+        # Record result (local + persistent history)
+        echo "$config_name" > "$tune_msg_dir/name_${round}.txt"
+        all_results=$(python3 -c "
+import json, sys
+results = json.loads(sys.stdin.read())
+results.append({
+    'round': ${round},
+    'name': open('${tune_msg_dir}/name_${round}.txt').read().strip(),
+    'gen_tps': ${round_gen},
+    'pp_tps': ${round_pp},
+    'flags': json.loads('${config_flags_json}'),
+    'status': '${round_status}'
+})
+print(json.dumps(results))
+" <<< "$all_results")
+
+        # Append to persistent history
+        append_tune_history "$round" "$round_gen" "$round_pp" "$round_status" "$config_flags_json" "$config_name"
+
+        # Feed result back to LLM for next round
+        local feedback
+        if [[ "$round_status" == "crashed" ]]; then
+            feedback="Result for '${config_name}': CRASHED (server failed to start — likely OOM or invalid flags). Current best: gen=${best_gen} tok/s. Baseline: gen=${baseline_gen} tok/s. Try a safer config next."
+        else
+            feedback="Result for '${config_name}': gen=${round_gen} tok/s, pp=${round_pp} tok/s (baseline: gen=${baseline_gen}, best so far: gen=${best_gen}). Propose your next config."
+        fi
+
+        echo "$feedback" > "$tune_msg_dir/feedback_${round}.txt"
+        messages=$(python3 -c "
+import json, sys
+msgs = json.loads(sys.stdin.read())
+msgs.append({'role': 'user', 'content': open('${tune_msg_dir}/feedback_${round}.txt').read()})
+print(json.dumps(msgs))
+" <<< "$messages")
+
+    done
+
+    # ── Save results ──
+    kill_server "$RUNNING_PID"
+    kill_server ""
+
+    echo ""
+    echo "═══════════════════════════════════════════════════"
+    if [[ "$best_name" == "baseline" ]]; then
+        echo "  AI Tune complete: baseline wins"
+        echo "  The heuristic config is already optimal (${baseline_gen} tok/s)"
+        echo "═══════════════════════════════════════════════════"
+    else
+        local total_improvement
+        total_improvement=$(python3 -c "g=${baseline_gen}; print(f'{(${best_gen}-g)/g*100:.1f}' if g>0 else '0')")
+        echo "  AI Tune complete: ${best_name} wins!"
+        echo "  Baseline: ${baseline_gen} tok/s → Best: ${best_gen} tok/s (+${total_improvement}%)"
+        echo "═══════════════════════════════════════════════════"
+
+        # Save to cache
+        echo "$best_name" > "$tune_msg_dir/best_name.txt"
+        python3 -c "
+import json
+from datetime import datetime
+cache = {
+    'model': '${MODEL_NAME}',
+    'tuned_at': datetime.utcnow().isoformat() + 'Z',
+    'provider': 'self',
+    'baseline_gen_tps': ${baseline_gen},
+    'baseline_pp_tps': ${baseline_pp},
+    'best_config': {
+        'name': open('${tune_msg_dir}/best_name.txt').read().strip(),
+        'flags': json.loads('${best_flags_json}'),
+        'gen_tps': ${best_gen},
+        'pp_tps': ${best_pp},
+    },
+    'rounds': ${AI_TUNE_ROUNDS},
+    'all_results': json.loads(open('/dev/stdin').read())
+}
+with open('${tune_cache}', 'w') as f:
+    json.dump(cache, f, indent=2)
+print(f'  Saved to: ${tune_cache}')
+" <<< "$all_results"
+    fi
+
+    # Cleanup temp files
+    rm -rf "$tune_msg_dir"
+
+    echo ""
+    exit 0
+}
+
+# Load AI tune cache — merges tuned flag overrides with fixed flags
+load_tune_cache() {
+    mkdir -p "$CACHE_DIR"
+    local tune_cache_key="${MODEL_NAME}_${TOTAL_SIZE_BYTES}_hw$(echo "${GPU_COUNT}_$(for i in $(seq 0 $((GPU_COUNT-1))); do echo -n "${GPU_NAME[$i]}_"; done)" | md5sum | cut -c1-8)"
+    local tune_cache="$CACHE_DIR/tune_${tune_cache_key}.json"
+
+    if [[ -f "$tune_cache" ]]; then
+        echo ""
+        echo "Using AI-tuned config (run --ai-tune --retune to re-optimize)"
+
+        # Merge fixed flags with tuned overrides
+        local tuned_flags
+        tuned_flags=$(python3 -c "
+import json
+d = json.load(open('$tune_cache'))
+overrides = d.get('best_config', {}).get('flags', {})
+
+fixed = {
+    '-m': '${MODEL_PATH}',
+    '--host': '${HOST}',
+    '--port': '${PORT}',
+    '--ctx-size': '${CTX_SIZE}',
+}
+
+flags = dict(fixed)
+for k, v in overrides.items():
+    if k in fixed:
+        continue
+    flags[k] = v
+
+parts = []
+for k, v in flags.items():
+    parts.append(k)
+    if v is not True and v != '' and v is not None:
+        parts.append(str(v))
+print(' '.join(parts))
+" 2>/dev/null)
+
+        if [[ -n "$tuned_flags" ]]; then
+            # shellcheck disable=SC2206
+            COMMON_FLAGS=($tuned_flags)
+            python3 -c "
+import json
+d = json.load(open('$tune_cache'))
+b = d.get('best_config', {})
+print(f'  Config: {b.get(\"name\", \"?\")}')" 2>/dev/null
+            python3 -c "
+import json
+d = json.load(open('$tune_cache'))
+b = d.get('best_config', {})
+print(f'  Expected: gen={b.get(\"gen_tps\", \"?\")} tok/s  pp={b.get(\"pp_tps\", \"?\")} tok/s')" 2>/dev/null
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# ═══════════════════════════════════════════════════════════════
 # Section 7: Execute Strategy
 # ═══════════════════════════════════════════════════════════════
 
+# AI Tune: run optimization if requested
+if (( DO_AI_TUNE )); then
+    ai_tune
+fi
+
+# Load cached tune config if available — bypasses strategy-specific launch
+TUNE_LOADED=0
+if (( !DO_AI_TUNE )); then
+    if load_tune_cache; then
+        TUNE_LOADED=1
+    fi
+fi
+
 # Kill any existing server on this port
 kill_server ""
+
+# If tune cache was loaded, launch directly with tuned flags (skip strategy logic)
+if (( TUNE_LOADED )); then
+    if (( DRY_RUN )); then
+        print_cmd "${COMMON_FLAGS[@]}"
+        exit 0
+    fi
+    run_with_restart "${COMMON_FLAGS[@]}"
+fi
 
 case "$STRATEGY" in
     cpu_only)
