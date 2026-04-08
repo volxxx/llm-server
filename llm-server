@@ -61,6 +61,8 @@ MODEL_DIR="${LLM_MODEL_DIR:-$HOME/ai_models}"
 mkdir -p "$MODEL_DIR"
 CACHE_DIR="$HOME/.cache/llm-server"
 SERVER_LOG="/tmp/llm-server.log"
+# Guard against stale directory at log path
+[[ -d "$SERVER_LOG" ]] && rm -rf "$SERVER_LOG" 2>/dev/null || SERVER_LOG="/tmp/llm-server-$$.log"
 LIB_HUB_DIR=""
 
 RETUNE=0
@@ -2459,37 +2461,28 @@ load_tune_cache() {
         echo ""
         echo "Using AI-tuned config (run --ai-tune --retune to re-optimize)"
 
-        # Merge fixed flags with tuned overrides
-        local tuned_flags
-        tuned_flags=$(python3 -c "
+        # Apply tuned overrides on top of COMMON_FLAGS
+        local tuned_extras
+        tuned_extras=$(python3 -c "
 import json
 d = json.load(open('$tune_cache'))
 overrides = d.get('best_config', {}).get('flags', {})
-
-fixed = {
-    '-m': '${MODEL_PATH}',
-    '--host': '${HOST}',
-    '--port': '${PORT}',
-    '--ctx-size': '${CTX_SIZE}',
-}
-
-flags = dict(fixed)
-for k, v in overrides.items():
-    if k in fixed:
-        continue
-    flags[k] = v
-
 parts = []
-for k, v in flags.items():
+for k, v in overrides.items():
+    # Skip protected flags and removals (false = don't include)
+    if k in ('-m', '--host', '--port', '--ctx-size', '-ot'):
+        continue
+    if v is False:
+        continue
     parts.append(k)
     if v is not True and v != '' and v is not None:
         parts.append(str(v))
 print(' '.join(parts))
 " 2>/dev/null)
 
-        if [[ -n "$tuned_flags" ]]; then
+        if [[ -n "$tuned_extras" ]]; then
             # shellcheck disable=SC2206
-            COMMON_FLAGS=($tuned_flags)
+            COMMON_FLAGS+=($tuned_extras)
             python3 -c "
 import json
 d = json.load(open('$tune_cache'))
