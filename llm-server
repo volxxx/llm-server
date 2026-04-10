@@ -168,6 +168,42 @@ find_server_binary() {
     echo ""
 }
 
+# Parse arguments first (sets BACKEND and other flags)
+# ─────────────────────────────────────────────────────────────────
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --retune)    RETUNE=1; shift ;;
+        --dry-run)   DRY_RUN=1; shift ;;
+        --verbose)   VERBOSE=1; shift ;;
+        --benchmark) BENCHMARK=1; shift ;;
+        --cpu)       CPU_ONLY=1; shift ;;
+        --model-dir) MODEL_DIR="$2"; shift 2 ;;
+        --port)      PORT="$2"; shift 2 ;;
+        --ctx-size)  CTX_SIZE="$2"; shift 2 ;;
+        --server-bin) USER_SERVER_BIN="$2"; shift 2 ;;
+        --lib-path)   USER_LIB_PATH="$2"; shift 2 ;;
+        --kv-quality) KV_QUALITY="$2"; shift 2 ;;
+        --gpus)      GPUS_FILTER="$2"; shift 2 ;;
+        --ram-budget) RAM_BUDGET_MB="$2"; shift 2 ;;
+        --mmproj)      MMPROJ_PATH="$2"; shift 2 ;;
+        --vision)      MMPROJ_PATH="auto"; shift ;;  # alias: auto-detect/download mmproj
+        --opencode)    START_OPENCODE=1; shift ;;
+        --download)  DOWNLOAD=1; shift ;;
+        --update)    DO_UPDATE=1; shift ;;
+        --ai-tune)   DO_AI_TUNE=1; shift ;;
+        --rounds)    USER_TUNE_ROUNDS="$2"; shift 2 ;;
+        --backend)   BACKEND="$2"; shift 2 ;;
+        --version)     echo "llm-server v$VERSION"; exit 0 ;;
+        --help|-h)
+            sed -n '3,/^$/s/^# \?//p' "$0"
+            exit 0
+            ;;
+        *)           MODEL_ARG="$1"; shift ;;
+    esac
+done
+
+# Now find the binary (BACKEND is now set from args)
 LLAMA_SERVER="$(find_server_binary)"
 
 # Initial lib hub setup

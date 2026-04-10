@@ -344,4 +344,7 @@ else
     SERVER_BIN_FLAG=(--server-bin "$LLAMA_BACKEND")
 fi
 
+# Pass env to skip update check (already done in GUI)
+export LLM_SERVER_UPDATE_CHECKED=1
+
 exec "$LAUNCHER" "${SERVER_BIN_FLAG[@]}" "${PASSTHROUGH_ARGS[@]}" "${OPT_FLAGS[@]+"${OPT_FLAGS[@]}"}" "$SELECTED"
