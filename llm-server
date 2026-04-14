@@ -41,7 +41,7 @@ set -euo pipefail
 # Section 1: Configuration & Argument Parsing
 # ═══════════════════════════════════════════════════════════════
 
-VERSION="2.0.0"
+VERSION="2.1.0"
 PORT="${LLM_PORT:-8081}"
 HOST="0.0.0.0"
 CTX_SIZE="${LLM_CTX_SIZE:-65536}"
