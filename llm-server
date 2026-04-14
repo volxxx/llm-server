@@ -28,6 +28,7 @@
 #   llm-server <model.gguf> --ai-tune          # AI-driven flag optimization (8 rounds)
 #   llm-server <model.gguf> --ai-tune --retune # Force re-tune even if cache exists
 #   llm-server <model.gguf> --ai-tune --rounds 4 # Customize number of rounds
+#   llm-server <model.gguf> --ai-tune --unlimited # Deep tune: 20 rounds, LLM may perturb tensor-split
 #
 # Environment variables:
 #   LLAMA_SERVER    Path to llama-server binary (auto-detected if not set)
@@ -88,6 +89,7 @@ RAM_BUDGET_MB=0
 MMPROJ_PATH=""
 DO_UPDATE=0
 DO_AI_TUNE=0
+DO_UNLIMITED=0
 START_OPENCODE=0
 BACKEND=""  # "llama" or "ik_llama" - empty = auto-detect
 
@@ -201,6 +203,7 @@ while [[ $# -gt 0 ]]; do
         --download)  DOWNLOAD=1; shift ;;
         --update)    DO_UPDATE=1; shift ;;
         --ai-tune)   DO_AI_TUNE=1; shift ;;
+        --unlimited) DO_UNLIMITED=1; shift ;;
         --tune-long-timeout) TUNE_LONG_TIMEOUT=1; shift ;;
         --rounds)    USER_TUNE_ROUNDS="$2"; shift 2 ;;
         --keep-alive) KEEP_ALIVE=1; shift ;;
@@ -291,16 +294,15 @@ if (( DO_UPDATE )); then
     if [[ -d "$LLM_SERVER_REPO/.git" ]]; then
         echo "═══ Updating llm-server ═══"
         pushd "$LLM_SERVER_REPO" > /dev/null
-        local old_hash=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
-        
+        old_hash=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
+
         # Save current script state for potential rollback
-        local script_path
         script_path=$(readlink -f "$0")
-        local script_backup="${script_path}.bak"
+        script_backup="${script_path}.bak"
         cp "$script_path" "$script_backup"
 
         if git pull --ff-only 2>&1 | tail -3; then
-            local new_hash=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
+            new_hash=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
             if [[ "$old_hash" != "$new_hash" ]]; then
                 echo "  Updated: $(git log --oneline "${old_hash}..${new_hash}" | wc -l) new commits"
                 git log --oneline "${old_hash}..${new_hash}" | head -5 | sed 's/^/    /'
@@ -1432,9 +1434,14 @@ choose_strategy() {
     # Single GPU: model + overhead fits in best GPU
     # Use tighter estimate (110%) — quantized weights don't expand much in VRAM,
     # and 130% global overhead is too conservative for single-GPU feasibility
+    # Use TOTAL VRAM (minus a 1GB safety margin), not FREE — pre-launch free
+    # VRAM dips from desktop/compositor would spuriously reject single-GPU.
+    # Transient users of GPU VRAM get displaced when the model reserves its slab.
     local best=${GPU_ORDER[0]}
+    local single_gpu_usable=$(( GPU_VRAM_TOTAL[best] - 1024 ))
+    (( single_gpu_usable < 0 )) && single_gpu_usable=0
     local single_gpu_needed=$(( TOTAL_SIZE_MB * 110 / 100 + KV_TOTAL_MB + COMPUTE_PER_GPU_MB ))
-    if (( single_gpu_needed <= GPU_VRAM_FREE[best] )); then
+    if (( single_gpu_needed <= single_gpu_usable )); then
         echo "single_gpu"
         return
     fi
@@ -1856,7 +1863,12 @@ run_with_restart() {
 # Section 6b: AI Tune — iterative LLM-driven flag optimization
 # ═══════════════════════════════════════════════════════════════
 
-AI_TUNE_ROUNDS="${USER_TUNE_ROUNDS:-8}"
+if (( DO_UNLIMITED )); then
+    AI_TUNE_ROUNDS="${USER_TUNE_ROUNDS:-20}"
+    TUNE_LONG_TIMEOUT=1
+else
+    AI_TUNE_ROUNDS="${USER_TUNE_ROUNDS:-8}"
+fi
 AI_TUNE_MAX_CRASHES=4  # free crash retries (don't count toward rounds)
 TUNE_HISTORY_FILE="$CACHE_DIR/tune_history.jsonl"
 
@@ -2130,7 +2142,9 @@ print(' '.join(parts))
 ai_tune() {
     mkdir -p "$CACHE_DIR"
     local tune_cache_key="${MODEL_NAME}_${TOTAL_SIZE_BYTES}_hw$(echo "${GPU_COUNT}_$(for i in $(seq 0 $((GPU_COUNT-1))); do echo -n "${GPU_NAME[$i]}_"; done)" | md5sum | cut -c1-8)"
-    local tune_cache="$CACHE_DIR/tune_${tune_cache_key}.json"
+    local tune_cache_suffix=""
+    (( DO_UNLIMITED )) && tune_cache_suffix="_unlimited"
+    local tune_cache="$CACHE_DIR/tune_${tune_cache_key}${tune_cache_suffix}.json"
 
     # Check existing cache (unless --retune)
     if [[ -f "$tune_cache" && "$RETUNE" == "0" ]]; then
@@ -2174,9 +2188,16 @@ print(f'  Tuned: {d.get(\"tuned_at\", \"?\")}')" 2>/dev/null
 
     echo ""
     echo "═══════════════════════════════════════════════════"
-    echo "  AI Tune — iterative LLM-driven optimization"
-    echo "  Model: ${MODEL_NAME}"
-    echo "  Rounds: ${AI_TUNE_ROUNDS}"
+    if (( DO_UNLIMITED )); then
+        echo "  AI Tune — UNLIMITED (deep) mode"
+        echo "  Model: ${MODEL_NAME}"
+        echo "  Rounds: ${AI_TUNE_ROUNDS}  (tensor-split + split-mode unlocked)"
+        echo "  Warning: this can take 1–3 hours on large models"
+    else
+        echo "  AI Tune — iterative LLM-driven optimization"
+        echo "  Model: ${MODEL_NAME}"
+        echo "  Rounds: ${AI_TUNE_ROUNDS}"
+    fi
     echo "═══════════════════════════════════════════════════"
     echo ""
 
@@ -2266,7 +2287,7 @@ Speed is the primary metric. Quality must not be sacrificed for marginal speed g
 - OOM = reduce batch, increase KV quantization, or spread across more GPUs
 - Immediate crash = you used an unsupported or invalid flag — remove it
 - Never repeat a config that crashed. Build on what worked instead.
-
+{unlimited_section}
 # Rules
 1. The baseline config flags are ALREADY applied. You only propose CHANGES.
 2. Your "flags" JSON should contain ONLY flags you want to ADD or OVERRIDE.
@@ -2282,6 +2303,13 @@ SYSEOF
 )
     # Replace {fixed_flags} placeholder
     system_prompt="${system_prompt//\{fixed_flags\}/$fixed_flags}"
+
+    # Replace {unlimited_section} — only active when --unlimited is set
+    local unlimited_section=""
+    if (( DO_UNLIMITED )); then
+        unlimited_section=$'\n# UNLIMITED MODE — deep tuning enabled\nYou may also perturb these normally-deterministic flags:\n- --tensor-split R0,R1,R2,... (ratios across GPUs; baseline is bandwidth-weighted — try ±10-30% skews)\n- --split-mode (graph | row | layer) — test alternatives on multi-GPU\n- Per-device layer counts via -ngl (total) combined with --main-gpu / --tensor-split\nThese have larger impact on heterogeneous rigs (mixed VRAM / PCIe bandwidths). Start small (one perturbation per round) so you can attribute gains.\n'
+    fi
+    system_prompt="${system_prompt//\{unlimited_section\}/$unlimited_section}"
 
     # Build the initial user message with all context
     local initial_context
@@ -2631,7 +2659,13 @@ print(f'  Saved to: ${tune_cache}')
 load_tune_cache() {
     mkdir -p "$CACHE_DIR"
     local tune_cache_key="${MODEL_NAME}_${TOTAL_SIZE_BYTES}_hw$(echo "${GPU_COUNT}_$(for i in $(seq 0 $((GPU_COUNT-1))); do echo -n "${GPU_NAME[$i]}_"; done)" | md5sum | cut -c1-8)"
-    local tune_cache="$CACHE_DIR/tune_${tune_cache_key}.json"
+    local tune_cache_suffix=""
+    (( DO_UNLIMITED )) && tune_cache_suffix="_unlimited"
+    local tune_cache="$CACHE_DIR/tune_${tune_cache_key}${tune_cache_suffix}.json"
+    # Unlimited cache preferred when --unlimited is set; fall back to regular if present
+    if (( DO_UNLIMITED )) && [[ ! -f "$tune_cache" && -f "$CACHE_DIR/tune_${tune_cache_key}.json" ]]; then
+        tune_cache="$CACHE_DIR/tune_${tune_cache_key}.json"
+    fi
 
     if [[ -f "$tune_cache" ]]; then
         echo ""
