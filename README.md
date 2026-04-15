@@ -12,7 +12,12 @@ llm-server model.gguf
 
 ![demo](demo.gif)
 
-## AI Tune — the model tunes itself
+## What's New
+
+- **Vision-Aware Tuning:** AI-Tune now maintains independent caches for vision-enabled runs. If `--vision` is used, the system auto-detects/downloads the necessary `mmproj` and uses a dedicated, vision-optimized configuration.
+- **Stage 1 (Heuristic) + Stage 2 (Tuned) Layering:** The launcher first calculates safe heuristic placement (Expert placement for MoE, tensor splitting for Dense) as a baseline. The AI Tuner is then strictly layered on top, optimizing performance parameters while respecting these critical stability boundaries (unless `--unlimited` is requested).
+- **Robust Fallback:** If `ik_llama` encounters hardware or compatibility issues, the launcher now automatically strips incompatible ik-specific flags and retries with the mainline `llama.cpp` binary.
+- **Vision-Aware VRAM Budgeting:** Accurate memory estimation for the vision encoder (`mmproj`) is now performed *before* launch to prevent OOM startup crashes.
 
 Most llm-server users leave 20-50% performance on the table because the "good enough" defaults aren't optimal for their specific hardware + model combination. `--ai-tune` fixes this:
 

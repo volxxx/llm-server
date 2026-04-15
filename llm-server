@@ -84,6 +84,7 @@ MODEL_ARG=""
 USER_SERVER_BIN=""
 USER_LIB_PATH=""
 KV_QUALITY="low"  # high (f16), mid (q8_0), low (q4_0, default)
+KV_QUALITY_EXPLICIT=0  # set to 1 when user passes --kv-quality — locks KV against AI-tune downgrades
 GPUS_FILTER=""
 RAM_BUDGET_MB=0
 MMPROJ_PATH=""
@@ -194,7 +195,7 @@ while [[ $# -gt 0 ]]; do
         --lib-path)   USER_LIB_PATH="$2"; shift 2 ;;
         --kv-quality)
             case "${2:-}" in high|mid|low) ;; *) echo "Error: --kv-quality must be one of: high, mid, low"; exit 1 ;; esac
-            KV_QUALITY="$2"; shift 2 ;;
+            KV_QUALITY="$2"; KV_QUALITY_EXPLICIT=1; shift 2 ;;
         --gpus)      GPUS_FILTER="$2"; shift 2 ;;
         --ram-budget) RAM_BUDGET_MB="$2"; shift 2 ;;
         --mmproj)      MMPROJ_PATH="$2"; shift 2 ;;
@@ -2133,13 +2134,17 @@ parse_tune_overrides() {
     local overrides_json="$1"
     TUNE_OVERRIDE_FLAGS=()
     local flags_str
-    flags_str=$(python3 -c "
-import json, sys
+    local kv_locked="$KV_QUALITY_EXPLICIT"
+    flags_str=$(KV_LOCKED="$kv_locked" python3 -c "
+import json, os, sys
 overrides = json.loads(sys.stdin.read())
+protected = {'-m', '--host', '--port', '--ctx-size', '-ot'}
+# User explicitly picked a KV quality — don't let AI-tune downgrade it
+if os.environ.get('KV_LOCKED') == '1':
+    protected |= {'--cache-type-k', '--cache-type-v'}
 parts = []
 for k, v in overrides.items():
-    # Skip flags already in COMMON_FLAGS (protected)
-    if k in ('-m', '--host', '--port', '--ctx-size', '-ot'):
+    if k in protected:
         continue
     if v is False:
         continue  # LLM wants to remove — we just don't add it
