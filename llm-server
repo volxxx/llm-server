@@ -85,6 +85,7 @@ USER_SERVER_BIN=""
 USER_LIB_PATH=""
 KV_QUALITY="low"  # high (f16), mid (q8_0), low (q4_0, default)
 KV_QUALITY_EXPLICIT=0  # set to 1 when user passes --kv-quality — locks KV against AI-tune downgrades
+PARALLEL_SLOTS=""      # --parallel N passthrough, empty = llama-server default (4)
 GPUS_FILTER=""
 RAM_BUDGET_MB=0
 MMPROJ_PATH=""
@@ -207,6 +208,7 @@ while [[ $# -gt 0 ]]; do
         --unlimited) DO_UNLIMITED=1; shift ;;
         --tune-long-timeout) TUNE_LONG_TIMEOUT=1; shift ;;
         --rounds)    USER_TUNE_ROUNDS="$2"; shift 2 ;;
+        --parallel)  PARALLEL_SLOTS="$2"; shift 2 ;;
         --keep-alive) KEEP_ALIVE=1; shift ;;
         --backend)   BACKEND="$2"; shift 2 ;;
         --version)     echo "llm-server v$VERSION"; exit 0 ;;
@@ -1200,6 +1202,13 @@ COMMON_FLAGS=(
     --threads-batch "$THREADS_BATCH"
 )
 
+# User-requested concurrent session count (affects KV slot split + compute buffers).
+# Default llama-server behavior (omit flag) uses 4 slots; passing --parallel 1
+# during --ai-tune gives the cleanest single-session benchmark signal.
+if [[ -n "$PARALLEL_SLOTS" ]]; then
+    COMMON_FLAGS+=(--parallel "$PARALLEL_SLOTS")
+fi
+
 # Conditional flags
 if [[ "$IS_IK_LLAMA" == "1" ]]; then
     COMMON_FLAGS+=(--run-time-repack)
@@ -2051,7 +2060,7 @@ bench_gen_tps() {
     result=$(curl -sf "$url/v1/chat/completions" \
         -H "Content-Type: application/json" \
         --max-time 180 \
-        -d '{"model":"test","messages":[{"role":"system","content":"You are a helpful assistant. /no_think"},{"role":"user","content":"Explain quantum computing in detail, covering qubits, superposition, entanglement, and error correction."}],"max_tokens":200,"temperature":0.1}' \
+        -d '{"model":"test","messages":[{"role":"system","content":"You are a helpful assistant. /no_think"},{"role":"user","content":"Explain quantum computing in detail, covering qubits, superposition, entanglement, and error correction."}],"max_tokens":500,"temperature":0.1}' \
         2>/dev/null)
 
     if [[ -z "$result" ]]; then
