@@ -411,6 +411,17 @@ if (( DO_UPDATE )); then
         local nproc
         nproc=$(nproc 2>/dev/null || echo 8)
 
+        # Ensure CUDA compiler is discoverable. Many systems have CUDA installed
+        # under /usr/local/cuda* but don't put nvcc on PATH; cmake will then fail
+        # to reconfigure even when an incremental rebuild would have worked.
+        if ! command -v nvcc >/dev/null 2>&1 && [[ -z "${CUDACXX:-}" ]]; then
+            local _nvcc=""
+            for d in /usr/local/cuda/bin /usr/local/cuda-*/bin; do
+                [[ -x "$d/nvcc" ]] && _nvcc="$d/nvcc" && export PATH="$d:$PATH" && break
+            done
+            [[ -n "$_nvcc" ]] && export CUDACXX="$_nvcc" && echo "  Found CUDA: $_nvcc"
+        fi
+
         # Ensure build directory exists with same cmake config
         if [[ -d "$build_dir" ]]; then
             # Rebuild with existing cmake cache (preserves CUDA flags etc.)
@@ -424,6 +435,13 @@ if (( DO_UPDATE )); then
                     val=$(grep "^GGML_CUDA_FA_ALL_QUANTS:BOOL=ON" "$build_dir/CMakeCache.txt" 2>/dev/null) && cmake_flags+=(-DGGML_CUDA_FA_ALL_QUANTS=ON)
                     val=$(grep "^GGML_CUDA_NCCL:BOOL=ON" "$build_dir/CMakeCache.txt" 2>/dev/null) && cmake_flags+=(-DGGML_CUDA_NCCL=ON)
                     val=$(grep "^CMAKE_CUDA_ARCHITECTURES:" "$build_dir/CMakeCache.txt" 2>/dev/null) && cmake_flags+=("-DCMAKE_CUDA_ARCHITECTURES=$(echo "$val" | cut -d= -f2)")
+                    # Preserve the CUDA compiler path if the old cache had a real one
+                    val=$(grep "^CMAKE_CUDA_COMPILER:" "$build_dir/CMakeCache.txt" 2>/dev/null | cut -d= -f2)
+                    if [[ -n "$val" && "$val" != *NOTFOUND* && -x "$val" ]]; then
+                        cmake_flags+=("-DCMAKE_CUDA_COMPILER=$val")
+                    elif [[ -n "${CUDACXX:-}" ]]; then
+                        cmake_flags+=("-DCMAKE_CUDA_COMPILER=$CUDACXX")
+                    fi
                 fi
                 rm -rf "$build_dir"
                 if cmake -B "$build_dir" -DCMAKE_BUILD_TYPE=Release "${cmake_flags[@]}" 2>&1 | tail -5 \
@@ -460,23 +478,43 @@ if (( DO_UPDATE )); then
             return 1
         fi
 
-        # Deep test: try loading a small model to verify it works
-        # Find any available model
+        # Deep test: try loading the smallest real model to verify it works
+        # Pick smallest .gguf, skipping projector/mmproj files (not loadable standalone)
         local test_model=""
-        for f in ~/ai_models/*.gguf; do
-            if [[ -f "$f" ]]; then
-                test_model="$f"
-                break
-            fi
-        done
+        test_model=$(ls -S ~/ai_models/*.gguf 2>/dev/null \
+            | grep -viE 'mmproj|projector' \
+            | tail -1)
 
         if [[ -n "$test_model" ]]; then
             echo "  Testing model launch: $(basename "$test_model")"
-            # Try to load model briefly (timeout 30s, exit after load)
-            if timeout 30s "$binary" -m "$test_model" -- ctx-size 2048 -n 1 --parallel 1 2>&1 | grep -q "model loaded"; then
+            # Pick a free port to avoid colliding with a running server
+            local test_port
+            test_port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()' 2>/dev/null || echo 18081)
+            # Load model with minimal context; kill as soon as server reports ready.
+            # Accept multiple "ready" markers across llama.cpp / ik_llama.cpp versions.
+            local test_log
+            test_log=$(mktemp)
+            timeout 120s "$binary" -m "$test_model" \
+                --ctx-size 512 --parallel 1 --port "$test_port" \
+                --host 127.0.0.1 -ngl 0 > "$test_log" 2>&1 &
+            local test_pid=$!
+            local ready=0
+            for _ in $(seq 1 120); do
+                if grep -qE "server is listening|main loop|model loaded|HTTP server listening" "$test_log"; then
+                    ready=1; break
+                fi
+                kill -0 "$test_pid" 2>/dev/null || break
+                sleep 1
+            done
+            kill "$test_pid" 2>/dev/null; wait "$test_pid" 2>/dev/null
+            if (( ready )); then
                 echo "  Model launch test: PASSED ✓"
+                rm -f "$test_log"
             else
                 echo "  Model launch test: FAILED — rolling back..."
+                echo "  --- last 10 lines of test output ---"
+                tail -10 "$test_log" | sed 's/^/    /'
+                rm -f "$test_log"
                 git checkout "$old_commit" 2>/dev/null
                 [[ -f "${binary}.backup" ]] && mv "${binary}.backup" "$binary"
                 echo "  Rolled back to $old_commit"
