@@ -2164,35 +2164,99 @@ build_fixed_flags() {
 # Sets TUNE_OVERRIDE_FLAGS array — these get passed to try_start ON TOP of COMMON_FLAGS
 TUNE_EXTRA_FIXED=()
 declare -a TUNE_OVERRIDE_FLAGS=()
+declare -a TUNE_OVERRIDE_KEYS=()
+
+# Launch server with overrides, stripping duplicates from COMMON_FLAGS.
+# Without this, the LLM proposing e.g. --cache-type-k q8_0 on top of
+# the baseline's --cache-type-k q4_0 causes "specified multiple times" errors.
+try_start_with_overrides() {
+    local deduped=()
+    local skip_next=0
+    for (( i=0; i<${#COMMON_FLAGS[@]}; i++ )); do
+        if (( skip_next )); then
+            skip_next=0
+            continue
+        fi
+        local flag="${COMMON_FLAGS[$i]}"
+        local dominated=0
+        for key in "${TUNE_OVERRIDE_KEYS[@]}"; do
+            if [[ "$flag" == "$key" ]]; then
+                dominated=1
+                # Skip the value too if the next element isn't a flag
+                if (( i + 1 < ${#COMMON_FLAGS[@]} )) && [[ "${COMMON_FLAGS[$((i+1))]}" != -* ]]; then
+                    skip_next=1
+                fi
+                break
+            fi
+        done
+        (( dominated )) || deduped+=("$flag")
+    done
+    "$LLAMA_SERVER" "${deduped[@]}" "${TUNE_OVERRIDE_FLAGS[@]}" > >(tee -a "$SERVER_LOG") 2>&1 &
+    local pid=$!
+    echo 1000 > "/proc/$pid/oom_score_adj" 2>/dev/null || true
+    local i=0
+    while (( i < HEALTH_TIMEOUT )); do
+        if curl -sf "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
+            RUNNING_PID=$pid
+            return 0
+        fi
+        if ! kill -0 "$pid" 2>/dev/null; then
+            return 1
+        fi
+        sleep 1; (( ++i ))
+    done
+    kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null || true
+    return 1
+}
 parse_tune_overrides() {
     local overrides_json="$1"
     TUNE_OVERRIDE_FLAGS=()
+    TUNE_OVERRIDE_KEYS=()
     local flags_str
     local kv_locked="$KV_QUALITY_EXPLICIT"
     flags_str=$(KV_LOCKED="$kv_locked" WSL2="$IS_WSL2" python3 -c "
 import json, os, sys
 overrides = json.loads(sys.stdin.read())
 protected = {'-m', '--host', '--port', '--ctx-size', '-ot'}
-# User explicitly picked a KV quality — don't let AI-tune downgrade it
 if os.environ.get('KV_LOCKED') == '1':
     protected |= {'--cache-type-k', '--cache-type-v'}
-# On WSL2, --mlock pins guest memory into the Windows host and can freeze it.
-# Refuse any LLM proposal that tries to re-enable it.
 if os.environ.get('WSL2') == '1':
     protected |= {'--mlock', '-mlk'}
-parts = []
+# Normalize common aliases the LLM hallucinates
+aliases = {
+    '--mg': '-mg', '--main-gpu': '-mg',
+    '--batch-size': '-b', '--ubatch-size': '-ub',
+    '--ngl': '-ngl', '--n-gpu-layers': '-ngl',
+    '--threads': '--threads', '-t': '--threads',
+    '--threads-batch': '--threads-batch', '-tb': '--threads-batch',
+    '--parallel': '--parallel', '-np': '--parallel',
+    '--flash-attn': '--flash-attn', '-fa': '--flash-attn',
+}
+normalized = {}
 for k, v in overrides.items():
+    k = aliases.get(k, k)
+    normalized[k] = v
+parts = []
+keys = []
+for k, v in normalized.items():
     if k in protected:
         continue
     if v is False:
-        continue  # LLM wants to remove — we just don't add it
+        continue
+    keys.append(k)
     parts.append(k)
     if v is not True and v != '' and v is not None:
         parts.append(str(v))
+# Line 1: flags, Line 2: keys to dedup against COMMON_FLAGS
 print(' '.join(parts))
+print(' '.join(keys))
 " <<< "$overrides_json") || true
+    local line1 line2
+    line1=$(echo "$flags_str" | head -1)
+    line2=$(echo "$flags_str" | tail -1)
     # shellcheck disable=SC2206
-    [[ -n "$flags_str" ]] && TUNE_OVERRIDE_FLAGS=($flags_str)
+    [[ -n "$line1" ]] && TUNE_OVERRIDE_FLAGS=($line1)
+    [[ -n "$line2" ]] && TUNE_OVERRIDE_KEYS=($line2)
 }
 
 # Main AI tune function — iterative: benchmark → query → benchmark → query ...
@@ -2584,7 +2648,7 @@ print(json.dumps(msgs))
 
         local round_gen="0" round_pp="0" round_status="ok"
 
-        if ! try_start "${TUNE_OVERRIDE_FLAGS[@]}"; then
+        if ! try_start_with_overrides; then
             echo "  CRASHED — config failed to start"
             kill_server ""
             round_status="crashed"
@@ -2759,28 +2823,64 @@ load_tune_cache() {
         echo ""
         echo "Using AI-tuned config (run --ai-tune --retune to re-optimize)"
 
-        # Apply tuned overrides on top of COMMON_FLAGS
-        local tuned_extras
-        tuned_extras=$(python3 -c "
+        # Apply tuned overrides on top of COMMON_FLAGS (with alias normalization + dedup)
+        local tuned_parsed
+        tuned_parsed=$(python3 -c "
 import json
 d = json.load(open('$tune_cache'))
 overrides = d.get('best_config', {}).get('flags', {})
+aliases = {
+    '--mg': '-mg', '--main-gpu': '-mg',
+    '--batch-size': '-b', '--ubatch-size': '-ub',
+    '--ngl': '-ngl', '--n-gpu-layers': '-ngl',
+    '--threads': '--threads', '-t': '--threads',
+    '--threads-batch': '--threads-batch', '-tb': '--threads-batch',
+    '--parallel': '--parallel', '-np': '--parallel',
+    '--flash-attn': '--flash-attn', '-fa': '--flash-attn',
+}
 parts = []
+keys = []
 for k, v in overrides.items():
-    # Skip protected flags and removals (false = don't include)
+    k = aliases.get(k, k)
     if k in ('-m', '--host', '--port', '--ctx-size', '-ot'):
         continue
     if v is False:
         continue
+    keys.append(k)
     parts.append(k)
     if v is not True and v != '' and v is not None:
         parts.append(str(v))
 print(' '.join(parts))
+print(' '.join(keys))
 " 2>/dev/null)
 
+        local tuned_extras tuned_keys_str
+        tuned_extras=$(echo "$tuned_parsed" | head -1)
+        tuned_keys_str=$(echo "$tuned_parsed" | tail -1)
+
         if [[ -n "$tuned_extras" ]]; then
+            # Strip flags from COMMON_FLAGS that the tuned config overrides
             # shellcheck disable=SC2206
-            COMMON_FLAGS+=($tuned_extras)
+            local override_keys=($tuned_keys_str)
+            local deduped=()
+            local skip_next=0
+            for (( ci=0; ci<${#COMMON_FLAGS[@]}; ci++ )); do
+                if (( skip_next )); then skip_next=0; continue; fi
+                local cflag="${COMMON_FLAGS[$ci]}"
+                local dominated=0
+                for key in "${override_keys[@]}"; do
+                    if [[ "$cflag" == "$key" ]]; then
+                        dominated=1
+                        if (( ci + 1 < ${#COMMON_FLAGS[@]} )) && [[ "${COMMON_FLAGS[$((ci+1))]}" != -* ]]; then
+                            skip_next=1
+                        fi
+                        break
+                    fi
+                done
+                (( dominated )) || deduped+=("$cflag")
+            done
+            # shellcheck disable=SC2206
+            COMMON_FLAGS=("${deduped[@]}" $tuned_extras)
             python3 -c "
 import json
 d = json.load(open('$tune_cache'))
