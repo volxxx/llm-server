@@ -1545,6 +1545,29 @@ kill_server() {
     done
 }
 
+# Wait for server health + verify it can generate. Sets RUNNING_PID on success.
+wait_for_ready() {
+    local pid=$1
+    local i=0
+    while (( i < HEALTH_TIMEOUT )); do
+        if curl -sf "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
+            local smoke
+            smoke=$(curl -sf --max-time 120 "http://127.0.0.1:${PORT}/v1/chat/completions" \
+                -H "Content-Type: application/json" \
+                -d '{"model":"test","messages":[{"role":"user","content":"Say OK"}],"max_tokens":4,"temperature":0}' 2>/dev/null)
+            if [[ -n "$smoke" ]] && echo "$smoke" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d.get('choices')" 2>/dev/null; then
+                RUNNING_PID=$pid
+                return 0
+            fi
+            if ! kill -0 "$pid" 2>/dev/null; then return 1; fi
+        fi
+        if ! kill -0 "$pid" 2>/dev/null; then return 1; fi
+        sleep 1; (( ++i ))
+    done
+    kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null || true
+    return 1
+}
+
 # Try starting server, wait for health. Sets RUNNING_PID on success.
 RUNNING_PID=""
 try_start() {
@@ -1560,19 +1583,7 @@ try_start() {
     local pid=$!
     # Mark server as OOM-kill target so it dies instead of the whole system
     echo 1000 > "/proc/$pid/oom_score_adj" 2>/dev/null || true
-    local i=0
-    while (( i < HEALTH_TIMEOUT )); do
-        if curl -sf "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
-            RUNNING_PID=$pid
-            return 0
-        fi
-        if ! kill -0 "$pid" 2>/dev/null; then
-            return 1
-        fi
-        sleep 1; (( ++i ))
-    done
-    kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null || true
-    return 1
+    wait_for_ready "$pid"
 }
 
 print_cmd() {
@@ -2212,19 +2223,7 @@ try_start_with_overrides() {
     "$LLAMA_SERVER" "${deduped[@]}" "${TUNE_OVERRIDE_FLAGS[@]}" > >(tee -a "$SERVER_LOG") 2>&1 &
     local pid=$!
     echo 1000 > "/proc/$pid/oom_score_adj" 2>/dev/null || true
-    local i=0
-    while (( i < HEALTH_TIMEOUT )); do
-        if curl -sf "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
-            RUNNING_PID=$pid
-            return 0
-        fi
-        if ! kill -0 "$pid" 2>/dev/null; then
-            return 1
-        fi
-        sleep 1; (( ++i ))
-    done
-    kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null || true
-    return 1
+    wait_for_ready "$pid"
 }
 parse_tune_overrides() {
     local overrides_json="$1"
