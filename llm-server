@@ -3479,13 +3479,35 @@ fi
 if [[ -f "$CACHE_FILE" && "$RETUNE" == "0" ]]; then
     echo ""
     echo "Using cached config: $CACHE_FILE"
-    # Validate cache file contains only expected content (comments and CACHED_GPU_ASSIGNMENTS)
-    if grep -qvE '^(#.*|CACHED_GPU_ASSIGNMENTS="[0-9: ]*"|[[:space:]]*)$' "$CACHE_FILE"; then
+    # Allow CACHED_GPU_ASSIGNMENTS (-ot path) or CACHED_NCPUMOE (recovery path)
+    if grep -qvE '^(#.*|CACHED_GPU_ASSIGNMENTS="[0-9: ]*"|CACHED_(NCPUMOE|BATCH|UBATCH|PARALLEL|KVUNIFIED)="[0-9]+"|[[:space:]]*)$' "$CACHE_FILE"; then
         echo "WARNING: Cache file contains unexpected content, ignoring."
         rm -f "$CACHE_FILE"
     else
         source "$CACHE_FILE"
     fi
+fi
+
+# Recovered --n-cpu-moe cache: apply and launch directly
+if [[ -f "$CACHE_FILE" && "$RETUNE" == "0" && -n "${CACHED_NCPUMOE:-}" ]]; then
+    echo "  Recovered config: --n-cpu-moe ${CACHED_NCPUMOE} -b ${CACHED_BATCH:-1024} -ub ${CACHED_UBATCH:-512} --parallel ${CACHED_PARALLEL:-2}"
+    # Strip batch/parallel from COMMON_FLAGS (we're overriding)
+    FILTERED=()
+    skip_next=0
+    for f in "${COMMON_FLAGS[@]}"; do
+        if (( skip_next )); then skip_next=0; continue; fi
+        case "$f" in
+            -b|-ub|--parallel) skip_next=1; continue ;;
+        esac
+        FILTERED+=("$f")
+    done
+    COMMON_FLAGS=("${FILTERED[@]}" -b "${CACHED_BATCH:-1024}" -ub "${CACHED_UBATCH:-512}" --parallel "${CACHED_PARALLEL:-2}" --n-cpu-moe "$CACHED_NCPUMOE")
+    [[ "${CACHED_KVUNIFIED:-0}" == "1" ]] && COMMON_FLAGS+=(--kv-unified)
+    if (( DRY_RUN )); then
+        print_cmd "${COMMON_FLAGS[@]}"
+        exit 0
+    fi
+    run_with_restart "${COMMON_FLAGS[@]}"
 fi
 
 if [[ -f "$CACHE_FILE" && "$RETUNE" == "0" && -n "${CACHED_GPU_ASSIGNMENTS:-}" ]]; then
@@ -3821,23 +3843,101 @@ CEOF
         run_with_restart "${COMMON_FLAGS[@]}" --no-mmap -ot "$OT_STRING"
     fi
 else
-    echo "FAILED: Could not start server even with conservative config."
-    echo "Check $SERVER_LOG for details."
-    tail -20 "$SERVER_LOG" 2>/dev/null
     echo ""
-    echo "═══ Model doesn't fit ═══"
-    echo "  Model needs: ~${VRAM_NEEDED_MB}MB (with overhead)"
-    echo "  Available:   ~$(( TOTAL_VRAM_MB + RAM_AVAIL_MB ))MB (GPU + RAM)"
-    echo ""
-    echo "  Options:"
-    echo "  1. Use a smaller quantization (e.g., Q4 → IQ3, IQ3 → IQ2)"
-    echo "  2. Reduce context size: --ctx-size 16384 or --ctx-size 8192"
-    echo "  3. Use a smaller model (fewer parameters or MoE with fewer active)"
-    if (( GPU_COUNT > 0 )); then
-        echo "  4. Add more RAM (cheapest upgrade for MoE expert offload)"
-    else
-        echo "  4. Add a GPU (even a used RTX 3060 12GB helps significantly)"
+    echo "  Conservative -ot placement failed — trying tighter recovery config..."
+    tail -5 "$SERVER_LOG" 2>/dev/null | sed 's/^/    /'
+    kill_server ""
+
+    # Recovery: use --n-cpu-moe (experts-only offload, tighter VRAM packing)
+    # with reduced batch + kv-unified + parallel=2 (matches manual-tune recipes
+    # that work when per-layer -ot placement hits compute-buffer fragmentation).
+    # See issue #8: RTX 4060 Ti 16GB + Qwen3.5-35B-A3B at 64k.
+    NCPUMOE_SUPPORTED=0
+    KVUNIFIED_SUPPORTED=0
+    if "$LLAMA_SERVER" --help 2>&1 | grep -qE "^ *-ncmoe.*--n-cpu-moe\b"; then
+        NCPUMOE_SUPPORTED=1
     fi
-    echo ""
-    exit 1
+    if "$LLAMA_SERVER" --help 2>&1 | grep -qE "^ *-kvu.*--kv-unified\b"; then
+        KVUNIFIED_SUPPORTED=1
+    fi
+
+    RECOVERED=0
+    if (( NCPUMOE_SUPPORTED )); then
+        # Strip incompatible flags from COMMON_FLAGS (we're replacing placement)
+        RECOVERY_COMMON=()
+        skip_next=0
+        for f in "${COMMON_FLAGS[@]}"; do
+            if (( skip_next )); then skip_next=0; continue; fi
+            case "$f" in
+                -b|-ub) skip_next=1; continue ;;
+                -ot|--override-tensor) skip_next=1; continue ;;
+                --parallel) skip_next=1; continue ;;
+            esac
+            RECOVERY_COMMON+=("$f")
+        done
+        RECOVERY_COMMON+=(-b 1024 -ub 512 --parallel 2)
+        (( KVUNIFIED_SUPPORTED )) && RECOVERY_COMMON+=(--kv-unified)
+
+        # Swap COMMON_FLAGS so try_start uses the recovery base
+        SAVED_COMMON_FLAGS=("${COMMON_FLAGS[@]}")
+        COMMON_FLAGS=("${RECOVERY_COMMON[@]}")
+
+        # Search upward from LAYERS_CPU; more CPU offload = less VRAM pressure
+        # Cap at LAYER_COUNT-2 (need at least a couple layers on GPU for speed)
+        START_N=$LAYERS_CPU
+        (( START_N < 1 )) && START_N=1
+        MAX_N=$(( LAYER_COUNT - 2 ))
+        (( MAX_N < START_N )) && MAX_N=$START_N
+        for N in $(seq "$START_N" 2 "$MAX_N"); do
+            echo "  Recovery attempt: --n-cpu-moe $N (b=1024 ub=512 parallel=2$( (( KVUNIFIED_SUPPORTED )) && echo ' kv-unified'))"
+            if try_start --n-cpu-moe "$N"; then
+                RECOVERED=1
+                echo "  Server healthy with --n-cpu-moe $N"
+                # Persist recovered config so next launch goes straight here
+                COMMON_FLAGS+=(--n-cpu-moe "$N")
+                OT_STRING=""
+                LAYERS_CPU=$N
+                # Cache the recovered mode so next launch skips the failed -ot path
+                cat > "$CACHE_FILE" <<CEOF
+# Auto-tuned config for $MODEL_NAME (recovered via --n-cpu-moe)
+# Generated: $(date)
+# Total layers: $LAYER_COUNT, Experts: $EXPERT_COUNT
+CACHED_NCPUMOE="$N"
+CACHED_BATCH="1024"
+CACHED_UBATCH="512"
+CACHED_PARALLEL="2"
+CACHED_KVUNIFIED="$KVUNIFIED_SUPPORTED"
+CEOF
+                break
+            fi
+            kill_server ""
+        done
+    fi
+
+    if (( ! RECOVERED )); then
+        echo ""
+        echo "FAILED: Could not start server even with conservative config."
+        echo "Check $SERVER_LOG for details."
+        tail -20 "$SERVER_LOG" 2>/dev/null
+        echo ""
+        echo "═══ Model doesn't fit ═══"
+        echo "  Model needs: ~${VRAM_NEEDED_MB}MB (with overhead)"
+        echo "  Available:   ~$(( TOTAL_VRAM_MB + RAM_AVAIL_MB ))MB (GPU + RAM)"
+        echo ""
+        echo "  Options:"
+        echo "  1. Use a smaller quantization (e.g., Q4 → IQ3, IQ3 → IQ2)"
+        echo "  2. Reduce context size: --ctx-size 16384 or --ctx-size 8192"
+        echo "  3. Use a smaller model (fewer parameters or MoE with fewer active)"
+        if (( GPU_COUNT > 0 )); then
+            echo "  4. Add more RAM (cheapest upgrade for MoE expert offload)"
+        else
+            echo "  4. Add a GPU (even a used RTX 3060 12GB helps significantly)"
+        fi
+        echo ""
+        exit 1
+    fi
+
+    # Recovered path: hand off to the crash-safe loop
+    kill_server "$RUNNING_PID"
+    run_with_restart "${COMMON_FLAGS[@]}"
 fi
