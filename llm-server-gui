@@ -17,6 +17,7 @@
 #   [v] Vision     — Auto-detect/download mmproj for multimodal
 #   [o] OpenCode   — Launch OpenCode after server is healthy
 #   [d] Dry Run    — Print command without executing
+#   [s] Show Cfgs  — Print cache/tune details for selected model and exit
 #   [Enter]        — Launch with defaults (skip all options)
 #
 # All llm-server flags can also be passed directly:
@@ -272,8 +273,14 @@ echo ""
 
 # Read selection
 while true; do
-    read -rp "Select model (1-$idx, q to quit): " choice
+    read -rp "Select model (1-$idx, s=show-configs, q to quit): " choice
     [[ "$choice" == "q" || "$choice" == "Q" ]] && exit 0
+    if [[ "$choice" == "s" || "$choice" == "S" ]]; then
+        echo ""
+        "$LAUNCHER" --show-configs
+        echo ""
+        continue
+    fi
     if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= idx )); then
         break
     fi
@@ -286,17 +293,18 @@ echo ""
 # Option toggles (skip with Enter)
 OPT_FLAGS=()
 echo "Options (toggle with letter, Enter to launch):"
-opt_aitune=0; opt_bench=0; opt_vision=0; opt_opencode=0; opt_dryrun=0; opt_keepalive=0
+opt_aitune=0; opt_bench=0; opt_vision=0; opt_opencode=0; opt_dryrun=0; opt_keepalive=0; opt_showcfg=0
 opt_rounds=8  # default rounds for AI Tune
 print_opts() {
-    local a="off" b="off" v="off" o="off" d="off" k="off"
+    local a="off" b="off" v="off" o="off" d="off" k="off" s="off"
     (( opt_aitune )) && a="ON"
     (( opt_bench )) && b="ON"
     (( opt_vision )) && v="ON"
     (( opt_opencode )) && o="ON"
     (( opt_dryrun )) && d="ON"
     (( opt_keepalive )) && k="ON"
-    printf "  [a] AI Tune %-3s  [b] Bench %-3s  [v] Vision %-3s  [o] OpenCode %-3s  [d] DryRun %-3s  [k] KeepAlive %-3s\r" "$a" "$b" "$v" "$o" "$d" "$k"
+    (( opt_showcfg )) && s="ON"
+    printf "  [a] AITune %-3s  [b] Bench %-3s  [v] Vision %-3s  [o] OpenCode %-3s  [d] DryRun %-3s  [k] KeepAlive %-3s  [s] ShowCfg %-3s\r" "$a" "$b" "$v" "$o" "$d" "$k" "$s"
 }
 print_opts
 while true; do
@@ -308,10 +316,11 @@ while true; do
         o|O) (( opt_opencode = !opt_opencode )) || true ;;
         d|D) (( opt_dryrun = !opt_dryrun )) || true ;;
         k|K) (( opt_keepalive = !opt_keepalive )) || true ;;
+        s|S) (( opt_showcfg = !opt_showcfg )) || true ;;
         "") break ;;
         *) continue ;;
     esac
-    printf "\r%150s\r" ""
+    printf "\r%200s\r" ""
     print_opts
 done
 echo ""
@@ -363,6 +372,7 @@ fi
 (( opt_opencode )) && OPT_FLAGS+=(--opencode)
 (( opt_dryrun )) && OPT_FLAGS+=(--dry-run)
 (( opt_keepalive )) && OPT_FLAGS+=(--keep-alive)
+(( opt_showcfg )) && OPT_FLAGS+=(--show-configs)
 
 echo "Launching: $(basename "$SELECTED") ${OPT_FLAGS[*]:-}"
 echo ""
